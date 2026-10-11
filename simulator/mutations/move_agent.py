@@ -4,7 +4,13 @@ from collections import deque
 from collections.abc import Container
 from typing import TYPE_CHECKING, Literal
 
-from simulator.entities import Agent, Bounds, get_objects_at
+from simulator.entities import (
+    ORIENTATION_DELTAS,
+    Agent,
+    Bounds,
+    Orientation,
+    get_objects_at,
+)
 from simulator.mutations.agent_mutation import AgentMutation
 from simulator.mutations.mutation import IllegalMutationError
 from simulator.mutations.virtual_input import VirtualInput, step_input
@@ -12,6 +18,10 @@ from simulator.types import Location
 
 if TYPE_CHECKING:
     from simulator.environment import Environment
+
+_FACING: dict[Location, Orientation] = {
+    delta: orientation for orientation, delta in ORIENTATION_DELTAS.items()
+}
 
 
 def is_in_bounds(bounds: Bounds | None, x: int, y: int) -> bool:
@@ -70,6 +80,8 @@ def reachable_walkable_positions(
 
 
 class MoveAgent(AgentMutation):
+    """Step to a neighbouring tile, turning to face the way the chef went."""
+
     kind: Literal["move_agent"] = "move_agent"
     dx: int
     dy: int
@@ -99,4 +111,6 @@ class MoveAgent(AgentMutation):
         if not is_walkable(environment, next_x, next_y, ignore_entity_id=agent.id):
             raise IllegalMutationError("Not walkable")
 
-        return environment.replace_entity(agent.copy_with(x=next_x, y=next_y))
+        return environment.replace_entity(
+            agent.copy_with(x=next_x, y=next_y, orientation=_FACING[(self.dx, self.dy)])
+        )
