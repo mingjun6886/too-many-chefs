@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 
+from controllers.navigation.floor import Floor, read_floor
 from controllers.navigation.movement import (
     direct_movement_mutation,
     is_next_to_target,
@@ -12,13 +13,9 @@ from controllers.navigation.movement import (
     require_agent,
     require_agent_location,
 )
-from controllers.navigation.paths import find_path
-from controllers.navigation.traffic import (
-    get_escape_mutation,
-    get_reserved_positions,
-    insert_before_move_into_agent,
-)
+from controllers.navigation.traffic import Chef, Traffic
 from simulator.context import Context
+from simulator.entities import Agent
 from simulator.environment import Environment
 from simulator.mutations import Mutation, MutationWithLocation
 from simulator.mutations.move_agent import MoveAgent
@@ -39,32 +36,38 @@ class MutationInterpolationPolicy(ABC):
         pass
 
 
-@dataclass(frozen=True)
-class PathCacheEntry:
-    target_location: Location
-    path: list[Location]
+@dataclass
+class _Intent:
+    """What one chef's next queued action asks of it this tick."""
+
+    chef: Chef
+    #: Mutations to send if the chef keeps its tile.
+    in_place: list[Mutation] = field(default_factory=list)
+    #: Whether sending ``in_place`` uses up the queued action.
+    consumes_in_place: bool = False
+    #: A queued direct move, sent as it is when the chef takes that step.
+    direct_move: Mutation | None = None
 
 
 class DefaultMutationInterpolationPolicy(MutationInterpolationPolicy):
     """Convert queued actions into simulator mutations.
 
-    The policy processes at most one queued action per agent per tick. Movement
-    primitives such as ``TurnAgent`` and ``MoveAgentForward`` are passed through
-    directly.
+    The policy processes at most one queued action per agent per tick.
+    Movement primitives such as ``TurnAgent`` and ``MoveAgentForward`` are
+    passed through directly.
 
-    Other actions carry a target location. The policy pathfinds to that location
-    and caches the route for later ticks. It discards and recomputes stale or
-    blocked paths.
+    Other actions carry a target location. The agent walks to a floor tile
+    beside the target, turns to face it, and emits the action once
+    ``can_apply_mutation(...)`` allows it. Until then the action stays queued.
 
-    When the agent is adjacent to the target, the policy emits a facing turn and
-    the action if ``can_apply_mutation(...)`` allows it.
-
-    If the target is unreachable or the action is not yet legal, the policy
-    returns no mutations and keeps the action queued.
+    ``traffic.Traffic`` picks every agent's next tile, in the order of the
+    agents' next queued steps. An agent may have to step aside for one that
+    comes earlier, and it keeps its queued action when it does.
     """
 
     def __init__(self) -> None:
-        self._path_cache: dict[str, PathCacheEntry] = {}
+        self._last_location: dict[str, Location] = {}
+        self._previous_location: dict[str, Location] = {}
 
     def get_mutations(
         self,
@@ -72,178 +75,115 @@ class DefaultMutationInterpolationPolicy(MutationInterpolationPolicy):
         environment: Environment,
         context: Context,
     ) -> tuple[list[Mutation], Plan]:
-        actions: list[Mutation] = []
         updated_plans = {agent_id: list(plan) for agent_id, plan in plans.items()}
-        committed_agent_ids: set[str] = set()
-
-        for agent_id in sorted(
+        order = sorted(
             updated_plans,
             key=lambda agent_id: (
                 updated_plans[agent_id][0][0] if len(updated_plans[agent_id]) else 9_999
             ),
-        ):
-            indexed_mutations = updated_plans[agent_id]
-            queued_mutations = [
-                mutation_with_location
-                for _, mutation_with_location in indexed_mutations
-            ]
-            mutations_to_queue, next_mutation_list = self._get_agent_mutations(
-                agent_id=agent_id,
-                next_mutations=queued_mutations,
-                committed_mutations=actions,
-                committed_agent_ids=committed_agent_ids,
-                environment=environment,
-                context=context,
+        )
+        floor = read_floor(environment)
+        intents = {
+            agent_id: self._intent(
+                agent_id,
+                [step for _, step in updated_plans[agent_id]],
+                environment,
+                floor,
             )
-            consumed_count = len(queued_mutations) - len(next_mutation_list)
-            updated_plans[agent_id] = indexed_mutations[consumed_count:]
-            insert_before_move_into_agent(
-                actions=actions,
-                mutations_to_queue=mutations_to_queue,
-                agent_id=agent_id,
-                environment=environment,
-            )
-            committed_agent_ids.add(agent_id)
+            for agent_id in order
+        }
+        # Chefs another controller drives keep their tiles as far as this
+        # policy can tell.
+        others = [
+            Chef(agent_id=agent.id, location=(agent.x, agent.y), fixed=True)
+            for agent in environment.get_entities_of_type(Agent)
+            if agent.id not in intents and agent.x is not None and agent.y is not None
+        ]
+        traffic = Traffic(floor, [intent.chef for intent in intents.values()] + others)
+        for agent_id in order:
+            traffic.plan(agent_id)
 
+        actions: list[Mutation] = []
+        for agent_id in traffic.in_move_order(order):
+            intent = intents[agent_id]
+            here = intent.chef.location
+            destination = traffic.next_location(agent_id)
+            if destination == here:
+                actions.extend(intent.in_place)
+                if intent.consumes_in_place:
+                    updated_plans[agent_id] = updated_plans[agent_id][1:]
+            elif (
+                intent.direct_move is not None
+                and destination == intent.chef.step
+                and not traffic.moved_by_others(agent_id)
+            ):
+                actions.append(intent.direct_move)
+                updated_plans[agent_id] = updated_plans[agent_id][1:]
+            else:
+                actions.extend(
+                    orient_and_wrap(
+                        agent_id=agent_id,
+                        start=here,
+                        destination=destination,
+                        mutation=MoveAgent(
+                            agent_id=agent_id,
+                            dx=destination[0] - here[0],
+                            dy=destination[1] - here[1],
+                        ),
+                    )
+                )
         return actions, updated_plans
 
-    def _get_agent_mutations(
+    def _intent(
         self,
-        *,
         agent_id: str,
-        next_mutations: list[MutationWithLocation],
-        committed_mutations: list[Mutation],
-        committed_agent_ids: set[str],
+        queued: list[MutationWithLocation],
         environment: Environment,
-        context: Context,
-    ) -> tuple[list[Mutation], list[MutationWithLocation]]:
+        floor: Floor,
+    ) -> _Intent:
         agent = require_agent(environment, agent_id)
-        current_location = require_agent_location(agent)
-        reserved_positions = get_reserved_positions(
-            committed_mutations=committed_mutations,
-            committed_agent_ids=committed_agent_ids,
-            environment=environment,
+        here = require_agent_location(agent)
+        if self._last_location.get(agent_id, here) != here:
+            self._previous_location[agent_id] = self._last_location[agent_id]
+        self._last_location[agent_id] = here
+        chef = Chef(
+            agent_id=agent_id,
+            location=here,
+            previous=self._previous_location.get(agent_id),
         )
-        escape_mutation = get_escape_mutation(
-            agent=agent,
-            current_location=current_location,
-            committed_mutations=committed_mutations,
-            committed_agent_ids=committed_agent_ids,
-            reserved_positions=reserved_positions,
-            environment=environment,
-        )
-        if escape_mutation is not None:
-            self._path_cache.pop(agent.id, None)
-            return (escape_mutation, next_mutations)
+        if not queued:
+            return _Intent(chef=chef)
 
-        if not next_mutations:
-            return ([], [])
+        mutation = queued[0].mutation
+        direct = direct_movement_mutation(mutation, environment)
+        if isinstance(direct, MoveAgent):
+            step = direct.next_position(environment)
+            if step not in floor.tiles:
+                # Send it anyway so the simulator reports it as illegal.
+                return _Intent(chef=chef, in_place=[direct], consumes_in_place=True)
+            return _Intent(
+                chef=replace(chef, step=step),
+                direct_move=direct,
+            )
+        if direct is not None:
+            return _Intent(chef=chef, in_place=[direct], consumes_in_place=True)
 
-        mutation_with_location = next_mutations[0]
-        remaining_mutations = next_mutations[1:]
-        mutation = mutation_with_location.mutation
-        direct_mutation = direct_movement_mutation(mutation, environment)
-        if direct_mutation is not None:
-            if (
-                isinstance(direct_mutation, MoveAgent)
-                and direct_mutation.next_position(environment) in reserved_positions
-            ):
-                return ([], next_mutations)
-            return ([direct_mutation], remaining_mutations)
-
-        agent_id = agent.id
-        target_location = mutation_with_location.location
-        if target_location is None:
+        target = queued[0].location
+        if target is None:
             raise ValueError(
                 f"Missing target location for {mutation.__class__.__name__}"
             )
-
-        if is_next_to_target(agent, target_location):
-            interaction_mutations = orient_and_wrap(
-                agent_id=agent.id,
-                start=current_location,
-                destination=target_location,
+        if is_next_to_target(agent, target):
+            interaction = orient_and_wrap(
+                agent_id=agent_id,
+                start=here,
+                destination=target,
                 mutation=mutation,
             )
-            if can_apply_mutation(environment, *interaction_mutations):
-                self._path_cache.pop(agent_id, None)
-                return (interaction_mutations, remaining_mutations)
-            return ([], next_mutations)
-
-        cached_path = self._prepare_path(
-            environment,
-            agent_id=agent_id,
-            current_location=current_location,
-            target_location=target_location,
-            reserved_positions=reserved_positions,
-        )
-        if len(cached_path) < 2:
-            self._path_cache.pop(agent_id, None)
-            cached_path = self._prepare_path(
-                environment,
-                agent_id=agent_id,
-                current_location=current_location,
-                target_location=target_location,
-                reserved_positions=reserved_positions,
-            )
-            return ([], next_mutations)
-
-        movement_mutations = orient_and_wrap(
-            agent_id=agent_id,
-            start=current_location,
-            destination=cached_path[1],
-            mutation=MoveAgent(
-                agent_id=agent_id,
-                dx=cached_path[1][0] - current_location[0],
-                dy=cached_path[1][1] - current_location[1],
-            ),
-        )
-
-        self._path_cache[agent_id] = PathCacheEntry(
-            target_location=target_location,
-            path=cached_path[1:],
-        )
-        return (movement_mutations, next_mutations)
-
-    def _prepare_path(
-        self,
-        environment: Environment,
-        *,
-        agent_id: str,
-        current_location: Location,
-        target_location: Location,
-        reserved_positions: set[Location],
-    ) -> list[Location]:
-        cached_entry = self._path_cache.get(agent_id)
-        if cached_entry is not None:
-            if (
-                cached_entry.target_location != target_location
-                or not cached_entry.path
-                or cached_entry.path[0] != current_location
-                or any(
-                    location in reserved_positions for location in cached_entry.path[1:]
+            if can_apply_mutation(environment, *interaction):
+                return _Intent(
+                    chef=replace(chef, fixed=True),
+                    in_place=interaction,
+                    consumes_in_place=True,
                 )
-            ):
-                self._path_cache.pop(agent_id, None)
-            else:
-                return cached_entry.path
-
-        path_to_target = find_path(
-            environment,
-            current_location,
-            target_location,
-            ignore_entity_id=agent_id,
-            ignore_agents=True,
-            blocked_locations=reserved_positions,
-        )
-
-        if not path_to_target:
-            cached_path = [current_location]
-        else:
-            cached_path = [current_location, *path_to_target[:-1]]
-
-        self._path_cache[agent_id] = PathCacheEntry(
-            target_location=target_location,
-            path=cached_path,
-        )
-        return cached_path
+        return _Intent(chef=replace(chef, goals=frozenset(floor.neighbours(target))))

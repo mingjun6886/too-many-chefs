@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from controllers.navigation import DefaultMutationInterpolationPolicy
 from controllers.pddl.default_controller import DefaultPDDLController
+from simulator.configuration.configuration import Configuration
+from simulator.configuration.load import load
 from simulator.context import Context
-from simulator.environment import filter_legal_actions
+from simulator.entities import Agent
+from simulator.environment import Environment, filter_legal_actions
 from simulator.mutations import (
     Cook,
     MoveAgent,
@@ -124,3 +127,130 @@ def test_cached_path_is_replanned_around_higher_priority_reservations() -> None:
         MoveAgent(agent_id=lower.id, dx=0, dy=1),
     ]
     assert updated_plans[lower.id] == [(1, lower_mutation)]
+
+
+def _layout_kitchen(*rows: str) -> Environment:
+    return load(
+        Configuration.from_dict(
+            {
+                "layout": "\n".join(rows),
+                "legend": {
+                    "counters": [{"kind": "counter", "symbol": "-"}],
+                    "foods": [
+                        {"kind": "food", "symbol": "t", "name": "catalog/food/tomato"}
+                    ],
+                    "agents": [
+                        {"kind": "agent", "symbol": "1"},
+                        {"kind": "agent", "symbol": "2"},
+                    ],
+                },
+            }
+        )
+    )
+
+
+def _chef_at(environment: Environment, x: int, y: int) -> str:
+    return next(
+        agent.id
+        for agent in environment.get_entities_of_type(Agent)
+        if (agent.x, agent.y) == (x, y)
+    )
+
+
+def test_idle_chef_in_a_nook_is_pulled_out_and_stays_out() -> None:
+    # The tomato's only free side is the nook, where chef two stands idle.
+    environment = _layout_kitchen(
+        "| - | - |-t | - |",
+        "|   |   | 2 | - |",
+        "| 1 |   | - | - |",
+    )
+    one = _chef_at(environment, 0, 2)
+    two = _chef_at(environment, 2, 1)
+    nook = (2, 1)
+    policy = DefaultMutationInterpolationPolicy()
+    plans = {
+        one: [planned(0, PickUp(agent_id=one), at=(2, 0))],
+        two: [],
+    }
+
+    left_nook = False
+    for _ in range(8):
+        actions, plans = policy.get_mutations(plans, environment, Context())
+        assert filter_legal_actions(environment, actions) == actions
+        environment = environment.step(actions)
+        if chef_location(environment, two) != nook:
+            left_nook = True
+        elif left_nook:
+            raise AssertionError("chef two stepped back into the nook")
+        if not plans[one]:
+            break
+
+    assert plans[one] == []
+    assert chef_location(environment, one) == nook
+
+
+def test_chef_acting_this_tick_is_not_pushed() -> None:
+    environment = _layout_kitchen(
+        "| 1 | 2 |-t |",
+        "|   |   | - |",
+    )
+    one = _chef_at(environment, 0, 0)
+    two = _chef_at(environment, 1, 0)
+    move = MutationWithLocation(
+        mutation=MoveAgent(agent_id=one, dx=1, dy=0), location=None
+    )
+
+    mutations, updated_plans = DefaultMutationInterpolationPolicy().get_mutations(
+        {
+            one: [(0, move)],
+            two: [planned(1, PickUp(agent_id=two), at=(2, 0))],
+        },
+        environment,
+        Context(),
+    )
+
+    assert mutations == [
+        TurnAgent(agent_id=two, orientation="e"),
+        PickUp(agent_id=two),
+    ]
+    assert updated_plans == {one: [(0, move)], two: []}
+
+
+def test_chefs_never_step_round_in_a_ring() -> None:
+    # Each chef wants the next one's tile, clockwise. The simulator runs moves
+    # one at a time, so none of them can go first.
+    chefs = [
+        chef("A", 0, 0, orientation="e"),
+        chef("B", 1, 0, orientation="s"),
+        chef("C", 1, 1, orientation="w"),
+        chef("D", 0, 1, orientation="n"),
+    ]
+    environment = kitchen(2, 2, *chefs)
+    plans = {
+        standing.id: [planned(index, MoveAgentForward(agent_id=standing.id))]
+        for index, standing in enumerate(chefs)
+    }
+
+    mutations, updated_plans = DefaultMutationInterpolationPolicy().get_mutations(
+        plans, environment, Context()
+    )
+
+    assert mutations == []
+    assert updated_plans == plans
+
+
+def test_chef_walks_around_a_chef_it_does_not_drive() -> None:
+    walker = chef("walker", 0, 0, orientation="e")
+    stranger = chef("stranger", 1, 0, costume="red")
+    environment = kitchen(3, 2, walker, stranger)
+
+    mutations, _ = DefaultMutationInterpolationPolicy().get_mutations(
+        {walker.id: [planned(0, PickUp(agent_id=walker.id), at=(2, 0))]},
+        environment,
+        Context(),
+    )
+
+    assert mutations == [
+        TurnAgent(agent_id=walker.id, orientation="s"),
+        MoveAgent(agent_id=walker.id, dx=0, dy=1),
+    ]
