@@ -19,9 +19,11 @@ from simulator.mutations import (
     AdvanceCooking,
     Combine,
     Cook,
+    Interact,
     Mutation,
     PickUp,
     Place,
+    TurnAgent,
 )
 from simulator.mutations.cooking import cooking_progress
 from simulator.mutations.mutation import IllegalMutationError, can_apply_mutation
@@ -42,7 +44,10 @@ CHOPPED_TOMATO = "catalog/food/chopped_tomato"
 
 
 def kitchen(**options: Any) -> Environment:
-    """Build ``|C|1|VP|``: a cutboard, a chef, then a pan on a stove."""
+    """Build ``|C|1|VP|``: a cutboard, a chef, then a pan on a stove.
+
+    ``west_storage`` swaps the cutboard for a storage of that food.
+    """
     return load(kitchen_configuration(**options))
 
 
@@ -59,13 +64,14 @@ def kitchen_configuration(
     board_holds: str | None = None,
     extra_recipes: list[dict[str, str]] | None = None,
     allow_illegal_recipes: bool = False,
+    west_storage: str | None = None,
 ) -> Configuration:
     def holding(name: str | None) -> dict[str, Any]:
         return {"held_item": {"name": name}} if name else {}
 
     return Configuration.from_dict(
         {
-            "layout": "|C|1|VP|",
+            "layout": "|S|1|VP|" if west_storage else "|C|1|VP|",
             "state": {"orders": [GRILLED_MEAT]},
             "rules": {
                 "timed_cooking": timed,
@@ -95,6 +101,9 @@ def kitchen_configuration(
                         **holding(board_holds),
                     },
                 ],
+                "storages": (
+                    [{"symbol": "S", "food_name": west_storage}] if west_storage else []
+                ),
                 "foods": [
                     {"name": MEAT},
                     {"name": GRILLED_MEAT, "raw": False},
@@ -322,6 +331,29 @@ def test_the_chef_who_put_the_food_in_is_credited() -> None:
     cooked = steps(environment, [Combine(agent_id=agent_id)], [])
 
     assert score_by_agent(cooked) == {agent_id: 5}
+
+
+def test_the_chef_who_fills_a_held_pan_from_storage_is_credited() -> None:
+    environment = kitchen(pan_time=2, chef_holds=None, west_storage=MEAT)
+    agent_id = chef(environment).id
+
+    lifted = environment.step([PickUp(agent_id=agent_id)])
+    filled = steps(
+        lifted,
+        [TurnAgent(agent_id=agent_id, orientation="w")],
+        [Interact(agent_id=agent_id)],
+    )
+    placed = steps(
+        filled,
+        [TurnAgent(agent_id=agent_id, orientation="e")],
+        [Place(agent_id=agent_id)],
+    )
+    cooked = idle(placed, 2)
+
+    assert contents(filled, PAN) == MEAT
+    assert contents(cooked, PAN) == GRILLED_MEAT
+    # 1 for fetching the meat, 5 for grilling it.
+    assert score_by_agent(cooked) == {agent_id: 6}
 
 
 def test_food_a_level_starts_with_cooks_for_the_kitchen_only() -> None:

@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal
 
-from simulator.entities import Agent, Equipment, Food
+from simulator.entities import (
+    Agent,
+    Bin,
+    Equipment,
+    Food,
+    get_first_game_object_of_type_at,
+)
 from simulator.mutations.agent_mutation import AgentMutation
 from simulator.mutations.mutation import IllegalMutationError
 from simulator.mutations.virtual_input import VirtualInput
@@ -12,6 +18,11 @@ if TYPE_CHECKING:
 
 
 class Discard(AgentMutation):
+    """Throw food away at the bin the agent is facing.
+
+    Agents empty their hands, or the cookware they hold, which they keep.
+    """
+
     kind: Literal["discard"] = "discard"
 
     def describe(self, environment: Environment) -> str:
@@ -23,6 +34,10 @@ class Discard(AgentMutation):
     def run(self, environment: Environment) -> Environment:
         agent = environment.get_entity_as(self.agent_id, Agent)
         if not agent or not agent.held_item_id:
+            raise IllegalMutationError()
+
+        target_x, target_y = agent.looking_at
+        if not get_first_game_object_of_type_at(environment, target_x, target_y, Bin):
             raise IllegalMutationError()
 
         held_food = environment.get_entity_as(agent.held_item_id, Food)

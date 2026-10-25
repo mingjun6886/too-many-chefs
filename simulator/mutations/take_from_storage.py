@@ -12,6 +12,7 @@ from simulator.entities import (
     get_first_game_object_of_type_at,
 )
 from simulator.mutations.agent_mutation import AgentMutation
+from simulator.mutations.combine import finish_combine
 from simulator.mutations.combine.combine_food_into_held_equipment import (
     combine_food_into_held_equipment,
 )
@@ -67,8 +68,9 @@ class TakeFromStorage(AgentMutation):
             required(agent.held_item_id), Equipment
         )
         if held_equipment:
+            stocked_environment = environment.with_entity(food)
             placed_environment = combine_food_into_held_equipment(
-                environment.with_entity(food),
+                stocked_environment,
                 state,
                 held_equipment=held_equipment,
                 source_food=food,
@@ -76,7 +78,14 @@ class TakeFromStorage(AgentMutation):
                 expected_output_name=self.expected_output_name,
             )
             if placed_environment:
-                return placed_environment.replace_entity(updated_state)
+                # Taking food into a held plate or pan is a combine, so finish
+                # it like one.
+                return finish_combine(
+                    stocked_environment,
+                    placed_environment.replace_entity(updated_state),
+                    updated_state,
+                    agent_id=self.agent_id,
+                )
 
         raise IllegalMutationError()
 

@@ -72,7 +72,9 @@ class Combine(AgentMutation):
                 expected_output_name=self.expected_output_name,
             )
             if combined_environment:
-                return self._finish(environment, combined_environment, state)
+                return finish_combine(
+                    environment, combined_environment, state, agent_id=self.agent_id
+                )
             raise IllegalMutationError()
 
         if isinstance(held_item, Food):
@@ -91,18 +93,27 @@ class Combine(AgentMutation):
                 expected_output_name=self.expected_output_name,
             )
             if combined_environment:
-                return self._finish(environment, combined_environment, state)
+                return finish_combine(
+                    environment, combined_environment, state, agent_id=self.agent_id
+                )
             raise IllegalMutationError()
         raise IllegalMutationError()
 
-    def _finish(
-        self,
-        before: Environment,
-        after: Environment,
-        state: OvercookedState,
-    ) -> Environment:
-        after = _notify_prepared_food(before, after, state, agent_id=self.agent_id)
-        return start_timers_for_new_food(before, after, agent_id=self.agent_id)
+
+def finish_combine(
+    before: Environment,
+    after: Environment,
+    state: OvercookedState,
+    *,
+    agent_id: str,
+) -> Environment:
+    """Score the food a combine made and start any station that now cooks it.
+
+    Taking food from storage into held equipment also ends here, so the chef
+    earns the same tip and cooking credit as a combine would give.
+    """
+    after = _notify_prepared_food(before, after, state, agent_id=agent_id)
+    return start_timers_for_new_food(before, after, agent_id=agent_id)
 
 
 def _notify_prepared_food(
@@ -144,6 +155,7 @@ __all__ = [
     "combine_food_into_held_equipment",
     "combine_from_equipment",
     "combine_from_food",
+    "finish_combine",
     "get_counter_item",
     "get_equipments_at",
     "get_equipments_top_first",

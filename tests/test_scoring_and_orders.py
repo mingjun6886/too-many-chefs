@@ -247,6 +247,68 @@ def test_combining_to_a_recipe_output_scores() -> None:
     assert state.score == 1
 
 
+def test_taking_food_onto_a_held_plate_scores_the_fetch_and_the_dish() -> None:
+    environment = load(
+        Configuration.from_dict(
+            {
+                "layout": "| A | B |",
+                "state": {"orders": ["catalog/food/hamburger"]},
+                "scoring": {
+                    "retrieve_order_component_reward": 2,
+                    "produce_ordered_item_reward": 5,
+                },
+                "legend": {
+                    "agents": [{"kind": "agent", "symbol": "A", "orientation": "e"}],
+                    "storages": [
+                        {
+                            "kind": "storage",
+                            "symbol": "B",
+                            "food_name": "catalog/food/bun",
+                        }
+                    ],
+                    "foods": [
+                        {"kind": "food", "name": "catalog/food/bun"},
+                        {"kind": "food", "name": "catalog/food/grilled_meat"},
+                        {"kind": "food", "name": "catalog/food/hamburger"},
+                    ],
+                },
+                "recipes": {
+                    "combine": [
+                        {
+                            "ingredients": [
+                                "catalog/food/bun",
+                                "catalog/food/grilled_meat",
+                            ],
+                            "to_make": "catalog/food/hamburger",
+                        }
+                    ]
+                },
+            }
+        )
+    )
+    agent = environment.get_first_entity_of_type(Agent)
+    assert agent is not None
+    meat = Food(name="catalog/food/grilled_meat", x=None, y=None)
+    plate = Plate(x=None, y=None, held_item_id=meat.id)
+    environment = (
+        environment.with_entity(meat)
+        .with_entity(plate)
+        .replace_entity(agent.copy_with(held_item_id=plate.id))
+    )
+
+    taken = TakeFromStorage(agent_id=agent.id).run(environment)
+
+    plated = taken.get_entity_as(plate.id, Plate)
+    assert plated is not None
+    assert plated.held_item_id is not None
+    burger = taken.get_entity_as(plated.held_item_id, Food)
+    state = taken.get_first_entity_of_type(OvercookedState)
+    assert burger is not None
+    assert burger.name == "catalog/food/hamburger"
+    assert state is not None
+    assert state.score == 7
+
+
 # A tip is paid once per order, so repeating a step cannot farm points.
 def test_fetching_the_same_component_again_pays_nothing_more() -> None:
     state = scoring_state()
