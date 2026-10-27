@@ -1,191 +1,381 @@
-"""Translate PDDL plans using a minimal example implementation.
+"""Translate plans for the instance-level domain into chef actions.
 
-``DefaultPDDLController`` creates a ``DefaultFromPDDL`` instance with the
-environment used to generate the plan, then calls ``from_pddl`` in a worker
-process with the solver's steps. Each ``PDDLPlanStep`` contains an action name
-and its arguments, exactly as returned by the solver, for example
-``pick_up empty_plate loc_2_0``. The domain has no chef type, so steps do not
-name a chef; every step is assigned to the first chef in the kitchen.
+``DefaultFromPDDL`` is built with the environment the plan was made for. It
+reads the same ``Kitchen`` as the problem generator, so every symbol in the
+plan maps back to a chef id, a tile, or a catalog name.
 
-``translate`` supports the three actions defined in ``overcooked.pddl``.
-Each step produces one mutation and the location the chef must face to
-perform it. For each action added to the domain, add a corresponding branch
-to ``translate``.
-
-A mutation is one action in the simulator, such as ``PickUp`` or ``Deliver``.
-The plan does not include movement. For each mutation, the controller moves
-the chef to an adjacent tile, turns it towards the target location, and
-applies the mutation once it is legal. Until then, execution of that chef's
-plan remains at the current step.
+Every action in overcooked.pddl names the chef first and the slot it acts on
+second; the slot's tile is where the chef acts. Each step becomes one
+mutation with its ``expected_*`` fields filled in from the step's own
+arguments, so a chef waits rather than acting on the wrong thing.
 """
 
 from __future__ import annotations
 
-import re
+from collections.abc import Callable
 
 from controllers.pddl.interfaces import FromPDDL, PDDLPlanStep
-from simulator.entities import Agent, OvercookedState
-from simulator.entities.plate import PLATE_NAME
+from controllers.pddl.submission.kitchen import Kitchen, Slot, read_kitchen
 from simulator.environment import Environment
-from simulator.mutations import Combine, Deliver, MutationWithLocation, PickUp
-from simulator.types import Location
-
-# These names match problem_generator.py: EMPTY_PLATE denotes a clean, empty
-# plate; DISH_PREFIX precedes the food name for a plate containing food, so
-# plated_catalog_food_coconut_juice is a plate of coconut juice.
-EMPTY_PLATE = "empty_plate"
-DISH_PREFIX = "plated_"
+from simulator.mutations import (
+    Combine,
+    Cook,
+    Deliver,
+    Discard,
+    MutationWithLocation,
+    PickUp,
+    Place,
+    TakeFromStorage,
+)
+from simulator.mutations.agent_mutation import AgentMutation
 
 
 class DefaultFromPDDL(FromPDDL):
-    """Translate a symbolic plan into simulator mutations.
-
-    The environment is the same one supplied to ``to_pddl``, allowing plan
-    symbols to be resolved to the corresponding food and steps to be assigned
-    to the chef.
-
-    The environment is a snapshot taken when planning starts. The kitchen
-    state may change before a step executes, for example if another chef
-    moves an item. Each mutation's ``expected_*`` fields check the relevant
-    conditions against the state at execution.
-    """
+    """Translate a symbolic plan into simulator mutations."""
 
     def __init__(self, environment: Environment) -> None:
         self._environment = environment
+        self._kitchen: Kitchen | None = None
+
+    @property
+    def kitchen(self) -> Kitchen:
+        if self._kitchen is None:
+            self._kitchen = read_kitchen(self._environment)
+        return self._kitchen
 
     def from_pddl(self, steps: list[PDDLPlanStep]) -> list[MutationWithLocation]:
-        """Translate all steps in plan order.
-
-        The controller carries out the mutations in the order returned.
-        """
-        plan: list[MutationWithLocation] = []
-        for step in steps:
-            plan.append(self.translate(step))
-        return plan
+        """Translate all steps in plan order."""
+        return [self.translate(step) for step in steps]
 
     def translate(self, step: PDDLPlanStep) -> MutationWithLocation:
-        """Convert one plan step to a mutation and the location it acts on.
-
-        ``step.parameters`` contains arguments in the order declared by the
-        action's ``:parameters`` in overcooked.pddl. Each branch below
-        unpacks the arguments in that order.
-
-        The ``expected_*`` fields specify what the chef should be holding and
-        facing. If the kitchen state no longer meets these conditions, the
-        mutation is illegal and the chef waits. A field left as None is not
-        checked.
-        """
-        chef_id = self.chef_id()
-        if step.name == "pick_up":
-            item, location = step.parameters
-            if is_plate(item):
-                # Plates are equipment, so PickUp checks the equipment name
-                # and contents. food_on_plate returns None for empty_plate,
-                # which disables the contents check; this step therefore
-                # does not verify that the plate is empty.
-                mutation = PickUp(
-                    agent_id=chef_id,
-                    expected_held_equipment_name=PLATE_NAME,
-                    expected_held_equipment_contents_name=self.food_on_plate(item),
-                )
-            else:
-                # Loose food is checked by its kitchen name.
-                mutation = PickUp(
-                    agent_id=chef_id,
-                    expected_input_name=self.food_name(item),
-                )
-        elif step.name == "add_to_plate":
-            # The chef holds ?plate and faces ?food at ?location. Combine adds
-            # the food to the plate. expected_output_name checks that the
-            # resulting dish matches ?result.
-            plate, food, location, result = step.parameters
-            mutation = Combine(
-                agent_id=chef_id,
-                expected_held_equipment_name=PLATE_NAME,
-                expected_held_equipment_contents_name=self.food_on_plate(plate),
-                expected_target_food_name=self.food_name(food),
-                expected_output_name=self.food_on_plate(result),
-            )
-        elif step.name == "deliver":
-            # Deliver requires a delivery tile and a plate containing an
-            # ordered dish.
-            plate, location = step.parameters
-            mutation = Deliver(
-                agent_id=chef_id,
-                expected_held_equipment_name=PLATE_NAME,
-                expected_held_food=self.food_on_plate(plate),
-            )
-        else:
-            # An unsupported action terminates the run with an error
-            # identifying the step.
+        handler = _HANDLERS.get(step.name)
+        if handler is None:
             raise ValueError(f"No translation for this action yet: {step}")
-        # location is the tile the chef acts on, not the tile it stands on.
-        return MutationWithLocation(
-            mutation=mutation, location=parse_location(location)
+        if len(step.parameters) < 2:
+            raise ValueError(f"Step names no chef and slot: {step}")
+        chef_id = self.chef_id(step.parameters[0])
+        slot = self.slot(step.parameters[1])
+        try:
+            mutation = handler(self, chef_id, slot, step.parameters[2:])
+        except (ValueError, KeyError) as error:
+            raise ValueError(f"Cannot translate {step}: {error}") from error
+        return MutationWithLocation(mutation=mutation, location=slot.location)
+
+    # --- Resolving symbols -----------------------------------------------------
+
+    def chef_id(self, symbol: str) -> str:
+        if symbol not in self.kitchen.chefs:
+            raise ValueError(f"Unknown chef in plan: {symbol}")
+        return self.kitchen.chefs[symbol]
+
+    def slot(self, symbol: str) -> Slot:
+        if symbol not in self.kitchen.slots:
+            raise ValueError(f"Unknown slot in plan: {symbol}")
+        return self.kitchen.slots[symbol]
+
+    def food(self, kind: str) -> str:
+        if kind not in self.kitchen.kinds:
+            raise ValueError(f"Unknown food kind in plan: {kind}")
+        return self.kitchen.kinds[kind]
+
+    def equipment(self, symbol: str) -> str:
+        if symbol not in self.kitchen.equipment:
+            raise ValueError(f"Unknown equipment kind in plan: {symbol}")
+        return self.kitchen.equipment[symbol]
+
+    def vessel(self, symbol: str) -> str:
+        if symbol not in self.kitchen.vessels:
+            raise ValueError(f"Unknown vessel in plan: {symbol}")
+        return self.kitchen.vessels[symbol].name
+
+    # --- One method per action, given the arguments after chef and slot ----------
+
+    def take(self, chef: str, slot: Slot, args: tuple[str, ...]) -> AgentMutation:
+        _food, kind = args
+        name = self.food(kind)
+        return TakeFromStorage(
+            agent_id=chef, expected_input_name=name, expected_output_name=name
         )
 
-    def chef_id(self) -> str:
-        """Return the ID of the chef that performs every step.
+    def take_into(self, chef: str, slot: Slot, args: tuple[str, ...]) -> AgentMutation:
+        _vessel, _ekind, _food, kind = args
+        name = self.food(kind)
+        return TakeFromStorage(
+            agent_id=chef, expected_input_name=name, expected_output_name=name
+        )
 
-        Plan steps do not specify a chef, so all steps are assigned to the
-        first chef in the kitchen.
-        """
-        return self._environment.get_entities_of_type(Agent)[0].id
+    def take_mix(self, chef: str, slot: Slot, args: tuple[str, ...]) -> AgentMutation:
+        _vessel, _ekind, _food, _kg, kind, out = args
+        return TakeFromStorage(
+            agent_id=chef,
+            expected_input_name=self.food(kind),
+            expected_output_name=self.food(out),
+        )
 
-    # --- Resolving PDDL symbols -----------------------------------------------
-    #
-    # These methods reverse the naming used in problem_generator.py.
-    # Changes to the naming convention must be applied to both files.
+    def pick_up(self, chef: str, slot: Slot, args: tuple[str, ...]) -> AgentMutation:
+        _food, kind = args
+        name = self.food(kind)
+        return PickUp(agent_id=chef, expected_input_name=name, expected_output_name=name)
 
-    def food_name(self, symbol: str) -> str:
-        """Return the kitchen food name corresponding to ``symbol``.
+    def pick_up_vessel(
+        self, chef: str, slot: Slot, args: tuple[str, ...]
+    ) -> AgentMutation:
+        (vessel,) = args
+        return PickUp(agent_id=chef, expected_held_equipment_name=self.vessel(vessel))
 
-        ``pddl_name`` is not invertible because it replaces several distinct
-        characters with ``_``. This method searches the level's food
-        definitions for a name that produces ``symbol``.
-        """
-        state = self._environment.get_first_entity_of_type(OvercookedState)
-        if state is not None:
-            for food_name in state.food_definitions:
-                if pddl_name(food_name) == symbol:
-                    return food_name
-        raise ValueError(f"Unknown food in plan: {symbol}")
+    def pick_up_full(
+        self, chef: str, slot: Slot, args: tuple[str, ...]
+    ) -> AgentMutation:
+        vessel, _food, kind = args
+        return PickUp(
+            agent_id=chef,
+            expected_held_equipment_name=self.vessel(vessel),
+            expected_held_equipment_contents_name=self.food(kind),
+        )
 
-    def food_on_plate(self, symbol: str) -> str | None:
-        """Return the food name for a plate symbol, or None for an empty plate.
+    def put_food(self, chef: str, slot: Slot, args: tuple[str, ...]) -> AgentMutation:
+        _food, kind = args
+        return Place(agent_id=chef, expected_held_food=self.food(kind))
 
-        For example, ``plated_catalog_food_coconut_juice`` gives
-        ``catalog/food/coconut_juice``.
-        """
-        if symbol == EMPTY_PLATE:
-            return None
-        if symbol.startswith(DISH_PREFIX):
-            return self.food_name(symbol.removeprefix(DISH_PREFIX))
-        raise ValueError(f"Unknown plate in plan: {symbol}")
+    def put_vessel(self, chef: str, slot: Slot, args: tuple[str, ...]) -> AgentMutation:
+        (vessel,) = args
+        return Place(agent_id=chef, expected_held_equipment_name=self.vessel(vessel))
+
+    def mount(self, chef: str, slot: Slot, args: tuple[str, ...]) -> AgentMutation:
+        vessel, _ekind, _base = args
+        return Place(agent_id=chef, expected_held_equipment_name=self.vessel(vessel))
+
+    def load(self, chef: str, slot: Slot, args: tuple[str, ...]) -> AgentMutation:
+        ekind, _food, kind = args
+        name = self.food(kind)
+        return Combine(
+            agent_id=chef,
+            expected_held_food=name,
+            expected_target_equipment_name=self.equipment(ekind),
+            expected_output_name=name,
+        )
+
+    def load_mix(self, chef: str, slot: Slot, args: tuple[str, ...]) -> AgentMutation:
+        ekind, _f, kf, _g, kg, out = args
+        return Combine(
+            agent_id=chef,
+            expected_held_food=self.food(kf),
+            expected_target_equipment_name=self.equipment(ekind),
+            expected_target_equipment_contents_name=self.food(kg),
+            expected_output_name=self.food(out),
+        )
+
+    grab_mix = load_mix
+
+    def fill(self, chef: str, slot: Slot, args: tuple[str, ...]) -> AgentMutation:
+        vessel, _ekind, _food, kind = args
+        name = self.food(kind)
+        return Combine(
+            agent_id=chef,
+            expected_held_food=name,
+            expected_target_equipment_name=self.vessel(vessel),
+            expected_output_name=name,
+        )
+
+    def fill_mix(self, chef: str, slot: Slot, args: tuple[str, ...]) -> AgentMutation:
+        vessel, _ekind, _f, kf, _g, kg, out = args
+        return Combine(
+            agent_id=chef,
+            expected_held_food=self.food(kf),
+            expected_target_equipment_name=self.vessel(vessel),
+            expected_target_equipment_contents_name=self.food(kg),
+            expected_output_name=self.food(out),
+        )
+
+    grab_from_vessel = fill_mix
+
+    def merge(self, chef: str, slot: Slot, args: tuple[str, ...]) -> AgentMutation:
+        _f, kf, _g, kg, out = args
+        return Combine(
+            agent_id=chef,
+            expected_held_food=self.food(kf),
+            expected_target_food_name=self.food(kg),
+            expected_output_name=self.food(out),
+        )
+
+    def collect(self, chef: str, slot: Slot, args: tuple[str, ...]) -> AgentMutation:
+        vessel, _ekind, _food, kind = args
+        name = self.food(kind)
+        return Combine(
+            agent_id=chef,
+            expected_held_equipment_name=self.vessel(vessel),
+            expected_output_name=name,
+            **_target_food(slot, name),
+        )
+
+    def collect_mix(
+        self, chef: str, slot: Slot, args: tuple[str, ...]
+    ) -> AgentMutation:
+        vessel, _ekind, _g, kg, _f, kf, out = args
+        return Combine(
+            agent_id=chef,
+            expected_held_equipment_name=self.vessel(vessel),
+            expected_held_equipment_contents_name=self.food(kg),
+            expected_output_name=self.food(out),
+            **_target_food(slot, self.food(kf)),
+        )
+
+    def collect_mix_station(
+        self, chef: str, slot: Slot, args: tuple[str, ...]
+    ) -> AgentMutation:
+        _se, *rest = args
+        return self.collect_mix(chef, slot, tuple(rest))
+
+    def pour(self, chef: str, slot: Slot, args: tuple[str, ...]) -> AgentMutation:
+        vessel, _food, kind, target, _ew = args
+        name = self.food(kind)
+        return Combine(
+            agent_id=chef,
+            expected_held_equipment_name=self.vessel(vessel),
+            expected_held_equipment_contents_name=name,
+            expected_target_equipment_name=self.vessel(target),
+            expected_output_name=name,
+        )
+
+    def pour_mix(self, chef: str, slot: Slot, args: tuple[str, ...]) -> AgentMutation:
+        vessel, _f, kf, target, _ew, _g, kg, out = args
+        return Combine(
+            agent_id=chef,
+            expected_held_equipment_name=self.vessel(vessel),
+            expected_held_equipment_contents_name=self.food(kf),
+            expected_target_equipment_name=self.vessel(target),
+            expected_target_equipment_contents_name=self.food(kg),
+            expected_output_name=self.food(out),
+        )
+
+    def pour_station(
+        self, chef: str, slot: Slot, args: tuple[str, ...]
+    ) -> AgentMutation:
+        ekind, vessel, _food, kind = args
+        name = self.food(kind)
+        return Combine(
+            agent_id=chef,
+            expected_held_equipment_name=self.vessel(vessel),
+            expected_held_equipment_contents_name=name,
+            expected_target_equipment_name=self.equipment(ekind),
+            expected_output_name=name,
+        )
+
+    def scoop(self, chef: str, slot: Slot, args: tuple[str, ...]) -> AgentMutation:
+        vessel, _ev, target, _food, kind = args
+        name = self.food(kind)
+        return Combine(
+            agent_id=chef,
+            expected_held_equipment_name=self.vessel(vessel),
+            expected_target_equipment_name=self.vessel(target),
+            expected_target_equipment_contents_name=name,
+            expected_output_name=name,
+        )
+
+    def scoop_mix(self, chef: str, slot: Slot, args: tuple[str, ...]) -> AgentMutation:
+        vessel, _ev, _g, kg, target, _ew, _f, kf, out = args
+        return Combine(
+            agent_id=chef,
+            expected_held_equipment_name=self.vessel(vessel),
+            expected_held_equipment_contents_name=self.food(kg),
+            expected_target_equipment_name=self.vessel(target),
+            expected_target_equipment_contents_name=self.food(kf),
+            expected_output_name=self.food(out),
+        )
+
+    def cook(self, chef: str, slot: Slot, args: tuple[str, ...]) -> AgentMutation:
+        ekind, _food, kind_in, kind_out = args
+        return Cook(
+            agent_id=chef,
+            expected_held_food=self.food(kind_in),
+            expected_input_name=self.equipment(ekind),
+            expected_output_name=self.food(kind_out),
+        )
+
+    def cook_vessel(
+        self, chef: str, slot: Slot, args: tuple[str, ...]
+    ) -> AgentMutation:
+        vessel, _ekind, _base, _food, kind_in, kind_out = args
+        return Cook(
+            agent_id=chef,
+            expected_held_food=self.food(kind_in),
+            expected_input_name=self.vessel(vessel),
+            expected_output_name=self.food(kind_out),
+        )
+
+    def deliver(self, chef: str, slot: Slot, args: tuple[str, ...]) -> AgentMutation:
+        vessel, _food, kind, _order = args
+        name = self.food(kind)
+        return Deliver(
+            agent_id=chef,
+            expected_held_equipment_name=self.vessel(vessel),
+            expected_held_food=name,
+            expected_held_equipment_contents_name=name,
+            expected_output_name=name,
+        )
+
+    def discard(self, chef: str, slot: Slot, args: tuple[str, ...]) -> AgentMutation:
+        _food, kind = args
+        return Discard(agent_id=chef, expected_held_food=self.food(kind))
+
+    def discard_from(
+        self, chef: str, slot: Slot, args: tuple[str, ...]
+    ) -> AgentMutation:
+        vessel, _food, kind = args
+        return Discard(
+            agent_id=chef,
+            expected_held_equipment_name=self.vessel(vessel),
+            expected_held_equipment_contents_name=self.food(kind),
+        )
 
 
-def is_plate(symbol: str) -> bool:
-    """Return whether ``symbol`` names a plate rather than loose food."""
-    return symbol == EMPTY_PLATE or symbol.startswith(DISH_PREFIX)
+def _target_food(slot: Slot, food_name: str) -> dict[str, str]:
+    """Return the expectations for food the chef faces on ``slot``.
 
-
-def parse_location(symbol: str) -> Location:
-    """Extract tile coordinates from a location symbol such as ``loc_2_0``.
-
-    This reverses ``location_symbol`` in problem_generator.py: ``loc_2_0`` is
-    the tile at x = 2, y = 0.
+    Food in a station is checked as the station's contents; food on a bare
+    counter as the target food.
     """
-    match = re.fullmatch(r"loc_(\d+)_(\d+)", symbol)
-    if match is None:
-        raise ValueError(f"Unknown location in plan: {symbol}")
-    return int(match.group(1)), int(match.group(2))
+    if slot.equipment is not None:
+        return {
+            "expected_target_equipment_name": slot.equipment,
+            "expected_target_equipment_contents_name": food_name,
+        }
+    return {"expected_target_food_name": food_name}
 
 
-def pddl_name(value: str) -> str:
-    """Convert a kitchen name to PDDL using the problem_generator.py convention.
+Handler = Callable[[DefaultFromPDDL, str, Slot, tuple[str, ...]], AgentMutation]
 
-    This duplicates ``pddl_name`` in problem_generator.py, where the naming
-    rules are documented. It can also be imported from that module to maintain
-    a single implementation.
-    """
-    return re.sub(r"[^0-9a-z_]+", "_", value.lower()).strip("_")
+_HANDLERS: dict[str, Handler] = {
+    name: getattr(DefaultFromPDDL, name)
+    for name in (
+        "take",
+        "take_into",
+        "take_mix",
+        "pick_up",
+        "pick_up_vessel",
+        "pick_up_full",
+        "put_food",
+        "put_vessel",
+        "mount",
+        "load",
+        "load_mix",
+        "grab_mix",
+        "fill",
+        "fill_mix",
+        "grab_from_vessel",
+        "merge",
+        "collect",
+        "collect_mix",
+        "collect_mix_station",
+        "pour",
+        "pour_mix",
+        "pour_station",
+        "scoop",
+        "scoop_mix",
+        "cook",
+        "cook_vessel",
+        "deliver",
+        "discard",
+        "discard_from",
+    )
+}

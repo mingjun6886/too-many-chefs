@@ -1,95 +1,92 @@
-"""Generate PDDL problems using a minimal example implementation.
+"""Describe the kitchen as a PDDL problem for the instance-level domain.
 
-``DefaultPDDLController`` creates one ``DefaultProblemGenerator`` instance and
-calls ``to_pddl`` in a worker process whenever a plan is required. The solver's
-result is then passed to ``DefaultFromPDDL`` in ``from_pddl.py``.
+``DefaultPDDLController`` calls ``to_pddl`` in a worker process whenever a
+plan is needed. ``kitchen.read_kitchen`` turns the environment into the
+objects the domain talks about (chefs, slots, food, vessels, kinds, orders),
+and the ``describe_*`` functions below write their objects, facts and goals.
+``from_pddl.py`` reads the same ``Kitchen`` back to translate the plan.
 
-This implementation and the domain in ``overcooked.pddl`` model the kitchen
-operations required to complete
-``levels/0_i_can_cook/0_0_coconut_juice_finished_on_counter.yaml``. The juice is
-already prepared; the chef must collect a plate, place the juice on it and
-deliver it.
-
-The model does not include storage, stations, recipes or counter
-reachability. For levels requiring these features, the solver finds no plan
-and the chefs remain idle.
-
-A PDDL problem has three parts:
-
-- objects that a plan can reference, each with a type from the domain,
-  such as ``loc_2_0 - location``;
-- initial facts describing the current state, such as
-  ``(item_at empty_plate loc_2_0)``;
-- goals specifying the required final state, such as
-  ``(delivered plated_catalog_food_coconut_juice)``.
-
-The planner uses only the information supplied in the domain and problem.
-If a plan omits a kitchen operation, or the solver finds no plan, check that
-the problem includes the relevant state. ``print(problem.to_pddl())`` in
-``build_problem`` displays the problem supplied to the planner.
-
-Extend the existing example rather than replacing it. ``build_problem`` calls
-a ``describe_*`` function for each aspect of the kitchen to add the relevant
-objects, facts and goals to a ``ProblemBuilder``, which writes the problem
-file. To extend the model, define another ``describe_*`` function, call it
-from ``build_problem``, and add domain actions that use the new facts.
+``should_replan`` runs in the simulator process. It asks for a new plan
+when an order is served or expires (``order_revision`` changes) and when the
+kitchen has stood still for a while, which means a chef is waiting on a step
+the kitchen no longer allows.
 """
 
 from __future__ import annotations
 
-import re
+import time
 from collections.abc import Collection
 from pathlib import Path
 
 from controllers.pddl.interfaces import PDDLProblem, ProblemGenerator
 from controllers.pddl.problem_builder import ProblemBuilder
-from simulator.entities import (
-    Agent,
-    Counter,
-    Delivery,
-    Food,
-    GameObject,
-    OvercookedState,
-    Plate,
+from controllers.pddl.submission.kitchen import (
+    Kitchen,
+    equipment_symbol,
+    kind_symbol,
+    read_kitchen,
 )
+from simulator.entities import Equipment, OvercookedState
 from simulator.environment import Environment
 
-# The domain is shared by all levels; to_pddl supplies this file unchanged.
 DOMAIN_PATH = Path(__file__).with_name("overcooked.pddl")
 
-# The domain represents plates by their contents, without distinguishing
-# individual plates. All clean, empty plates use EMPTY_PLATE; plates
-# containing food use ``dish_symbol``.
-EMPTY_PLATE = "empty_plate"
+# A kitchen whose timestep has not moved for this long, over at least this
+# many checks, is stuck: replan from the kitchen as it is.
+STALL_SECONDS = 1.0
+STALL_CHECKS = 20
+# A gap this long between checks means a plan was being computed meanwhile.
+PLANNING_GAP_SECONDS = 0.25
 
 
 class DefaultProblemGenerator(ProblemGenerator):
-    """Generate a PDDL problem from the kitchen state and determine when to replan.
+    """Generate problems and decide when to replan."""
 
-    The inherited ``ProblemGenerator.should_replan`` retains the current plan
-    until all steps have been executed. Override this method if the controller
-    needs to respond to changes in the kitchen state before then.
-    """
+    def __init__(self) -> None:
+        self._revision: int | None = None
+        self._timestep: int | None = None
+        self._still_since = 0.0
+        self._still_checks = 0
+        self._last_check = 0.0
 
     def to_pddl(
         self,
         environment: Environment,
         controlled_agent_ids: Collection[str] | None = None,
     ) -> PDDLProblem:
-        """Return the domain and a problem for ``environment``.
-
-        ``controlled_agent_ids`` identifies the chefs assigned to this
-        controller. Other chefs remain in the kitchen as obstacles. ``None``
-        assigns all chefs to this controller.
-
-        This method runs in a separate worker process. Changes it makes to
-        ``self`` are therefore not visible to ``should_replan``, which runs
-        in the simulator process.
-        """
-        chef = the_chef(environment, controlled_agent_ids)
+        """Return the domain and a problem for ``environment``."""
         return PDDLProblem(
-            domain=build_domain(), problem=build_problem(environment, chef)
+            domain=build_domain(),
+            problem=build_problem(environment, controlled_agent_ids),
         )
+
+    def should_replan(self, environment: Environment) -> bool:
+        state = environment.get_first_entity_of_type(OvercookedState)
+        now = time.monotonic()
+        gap = now - self._last_check
+        self._last_check = now
+        revision = state.order_revision if state is not None else 0
+        if self._revision is None or revision != self._revision:
+            first = self._revision is None
+            self._revision = revision
+            self._watch(environment.timestep, now)
+            return not first
+        if environment.timestep != self._timestep or gap > PLANNING_GAP_SECONDS:
+            self._watch(environment.timestep, now)
+            return False
+        self._still_checks += 1
+        if (
+            self._still_checks >= STALL_CHECKS
+            and now - self._still_since >= STALL_SECONDS
+        ):
+            self._watch(environment.timestep, now)
+            return True
+        return False
+
+    def _watch(self, timestep: int, now: float) -> None:
+        self._timestep = timestep
+        self._still_since = now
+        self._still_checks = 0
 
 
 def build_domain() -> str:
@@ -97,206 +94,155 @@ def build_domain() -> str:
     return DOMAIN_PATH.read_text(encoding="utf-8")
 
 
-def build_problem(environment: Environment, chef: Agent | None) -> str:
-    """Describe the kitchen as a problem for the domain in overcooked.pddl.
-
-    Every object symbol used in a fact or goal must be declared with ``add_object``.
-    ``describe_food`` declares the food and plate symbols that the other
-    functions use in their facts.
-    """
-    # domain_name must match the "(define (domain overcooked)" line in
-    # overcooked.pddl, or the planner rejects the problem. problem_name can be
-    # any PDDL name.
+def build_problem(
+    environment: Environment,
+    controlled_agent_ids: Collection[str] | None = None,
+) -> str:
+    """Describe the kitchen as a problem for the domain in overcooked.pddl."""
+    kitchen = read_kitchen(environment, controlled_agent_ids)
+    state = environment.get_first_entity_of_type(OvercookedState)
+    if state is None:
+        raise ValueError("The environment has no OvercookedState")
     problem = ProblemBuilder(domain_name="overcooked", problem_name="kitchen")
-    describe_food(environment, problem)
-    describe_chef(environment, chef, problem)
-    describe_counters(environment, problem)
-    describe_deliveries(environment, problem)
-    describe_orders(environment, problem)
+    describe_kinds(kitchen, state, problem)
+    describe_equipment(environment, kitchen, state, problem)
+    describe_slots(kitchen, problem)
+    describe_vessels(kitchen, problem)
+    describe_food(kitchen, problem)
+    describe_chefs(kitchen, problem)
+    describe_orders(kitchen, problem)
     return problem.to_pddl()
 
 
 # --- Kitchen description ----------------------------------------------------
 
 
-def describe_food(environment: Environment, problem: ProblemBuilder) -> None:
-    """Declare a symbol for each food in the level and for a plate holding it.
-
-    ``food_definitions`` lists the level's ingredients, intermediate foods
-    and finished dishes. Each has a food symbol and a plated symbol,
-    regardless of whether an order requires its plated form.
-
-    Food and its plated form are separate objects, allowing the plan to
-    distinguish which the chef is carrying. A ``plating`` fact relates them:
-    ``(plating empty_plate catalog_food_coconut_juice
-    plated_catalog_food_coconut_juice)`` specifies that adding coconut juice
-    to an empty plate produces a plate of coconut juice.
-    """
-    empty_plate = problem.add_object(EMPTY_PLATE, "plate")
-    for food_name in kitchen_state(environment).food_definitions:
-        food = problem.add_object(food_symbol(food_name), "food")
-        dish = problem.add_object(dish_symbol(food_name), "plate")
-        problem.add_fact(f"(plating {empty_plate} {food} {dish})")
-
-
-def describe_chef(
-    environment: Environment, chef: Agent | None, problem: ProblemBuilder
+def describe_kinds(
+    kitchen: Kitchen, state: OvercookedState, problem: ProblemBuilder
 ) -> None:
-    """Record what the chef is holding.
-
-    The chef is not a PDDL object: ``hand_empty`` and ``holding`` describe the
-    chef that performs every action. To plan for several chefs, the domain
-    would require a chef type and a chef parameter in these facts.
-
-    If there is no chef to plan for, or ``item_symbol`` cannot represent the
-    held item, neither fact is added and the solver finds no plan.
-    """
-    if chef is None:
-        return
-    if chef.held_item_id is None:
-        problem.add_fact("(hand_empty)")
-        return
-    held = item_symbol(environment, chef.held_item_id)
-    if held is not None:
-        problem.add_fact(f"(holding {held})")
-
-
-def describe_counters(environment: Environment, problem: ProblemBuilder) -> None:
-    """Record the items on counters.
-
-    Counters containing supported items are represented by location objects
-    named by their grid positions, such as ``loc_1_0``. Empty counters are
-    omitted because this domain has no action for putting an item down.
-    Adding such an action would require those counters to be included.
-    Items that ``item_symbol`` cannot represent, such as dirty plates, are
-    also omitted from the planner's model.
-    """
-    for counter in environment.get_entities_of_type(Counter):
-        if counter.held_item_id is None:
+    """Declare each food kind, which kinds are raw, and the recipes."""
+    for symbol, name in kitchen.kinds.items():
+        problem.add_object(symbol, "fkind")
+        if state.is_raw_food(name):
+            problem.add_fact(f"(raw {symbol})")
+    for recipe in state.cook_recipes:
+        equipment = equipment_symbol(recipe.equipment)
+        if equipment not in kitchen.equipment:
             continue
-        item = item_symbol(environment, counter.held_item_id)
-        if item is None:
+        problem.add_fact(
+            f"(cooks {equipment} {kind_symbol(recipe.ingredient)}"
+            f" {kind_symbol(recipe.output)})"
+        )
+    for recipe in state.combine_recipes:
+        ingredients = sorted(recipe.ingredients)
+        if len(ingredients) == 1:
+            ingredients *= 2
+        if len(ingredients) != 2:
             continue
-        location = problem.add_object(location_symbol(counter), "location")
-        problem.add_fact(f"(item_at {item} {location})")
+        first, second = (kind_symbol(name) for name in ingredients)
+        output = kind_symbol(recipe.output)
+        problem.add_fact(f"(combines {first} {second} {output})")
+        problem.add_fact(f"(combines {second} {first} {output})")
 
 
-def describe_deliveries(environment: Environment, problem: ProblemBuilder) -> None:
-    """Identify delivery locations for plated food.
-
-    Delivery tiles become location objects, named after their grid position
-    in the same way as counters.
-    """
-    for delivery in environment.get_entities_of_type(Delivery):
-        location = problem.add_object(location_symbol(delivery), "location")
-        problem.add_fact(f"(delivery_location {location})")
-
-
-def describe_orders(environment: Environment, problem: ProblemBuilder) -> None:
-    """Add a goal to deliver each visible order on a plate.
-
-    ``ProblemBuilder`` combines goals with ``and``, requiring the plan to
-    satisfy all of them. Orders for the same dish produce identical goals,
-    which the builder includes only once. This example therefore serves
-    that dish once; serving duplicate orders requires distinct goals.
-    """
-    for order in kitchen_state(environment).visible_orders:
-        problem.add_goal(f"(delivered {dish_symbol(order)})")
-
-
-# --- Environment access -----------------------------------------------------
-
-
-def the_chef(
-    environment: Environment, controlled_agent_ids: Collection[str] | None
-) -> Agent | None:
-    """Return the chef that performs every action in the plan.
-
-    Returns the first chef assigned to this controller, or None if no chef
-    is assigned. from_pddl.py assigns every plan step to the first chef in
-    the kitchen. These selections agree when the kitchen has a single chef.
-    """
-    chefs = environment.get_entities_of_type(Agent)
-    if controlled_agent_ids is not None:
-        chefs = [chef for chef in chefs if chef.id in controlled_agent_ids]
-    return chefs[0] if chefs else None
+def describe_equipment(
+    environment: Environment,
+    kitchen: Kitchen,
+    state: OvercookedState,
+    problem: ProblemBuilder,
+) -> None:
+    """Declare equipment kinds: what each accepts, needs and cooks by hand."""
+    entities = environment.get_entities_of_type(Equipment)
+    plate_names = {
+        vessel.name for vessel in kitchen.vessels.values() if vessel.plate
+    }
+    for symbol, name in kitchen.equipment.items():
+        problem.add_object(symbol, "ekind")
+        for kind, food_name in kitchen.kinds.items():
+            if name in plate_names or state.equipment_accepts(food_name, name):
+                problem.add_fact(f"(accepts {symbol} {kind})")
+        same = [entity for entity in entities if entity.name == name]
+        if not any(entity.cooks_by_itself for entity in same):
+            problem.add_fact(f"(manual {symbol})")
+        for entity in same:
+            if entity.requires:
+                problem.add_fact(
+                    f"(requires {symbol} {equipment_symbol(entity.requires)})"
+                )
 
 
-def kitchen_state(environment: Environment) -> OvercookedState:
-    """Return the entity containing orders, recipes and food definitions.
-
-    This information applies to the entire kitchen and is stored in a single
-    ``OvercookedState`` entity.
-    """
-    state = environment.get_first_entity_of_type(OvercookedState)
-    if state is None:
-        raise ValueError("The environment has no OvercookedState")
-    return state
-
-
-# --- PDDL names --------------------------------------------------------------
-#
-# Each problem object has a symbol, which the planner uses in its output.
-# These functions define the naming convention. from_pddl.py uses the same
-# convention to resolve plan symbols to kitchen names; changes must be
-# applied consistently in both files.
-
-
-def item_symbol(environment: Environment, item_id: str) -> str | None:
-    """Return the symbol for an item, or None if this example cannot describe it.
-
-    Food uses ``food_symbol``. Clean plates are represented by their contents,
-    using ``EMPTY_PLATE`` or ``dish_symbol``. Unsupported items, such as dirty
-    plates or pots, return None and are omitted by the ``describe_*`` functions.
-    """
-    item = environment.get_entity(item_id)
-    if isinstance(item, Food):
-        return food_symbol(item.name)
-    if isinstance(item, Plate) and not item.dirty:
-        if item.held_item_id is None:
-            return EMPTY_PLATE
-        food = environment.get_entity_as(item.held_item_id, Food)
-        if food is not None:
-            return dish_symbol(food.name)
-    return None
+def describe_slots(kitchen: Kitchen, problem: ProblemBuilder) -> None:
+    """Declare each tile a chef acts on and what it is."""
+    for slot in kitchen.slots.values():
+        if slot.blocked:
+            continue
+        symbol = problem.add_object(slot.symbol, "slot")
+        if slot.counter:
+            problem.add_fact(f"(counter {symbol})")
+        if slot.equipment is not None:
+            problem.add_fact(f"(station {symbol} {equipment_symbol(slot.equipment)})")
+        if slot.storage is not None:
+            problem.add_fact(f"(storage {symbol} {kind_symbol(slot.storage)})")
+        if slot.delivery:
+            problem.add_fact(f"(delivery {symbol})")
+        if slot.bin:
+            problem.add_fact(f"(bin {symbol})")
+        if slot.item is None and (slot.counter or slot.equipment is not None):
+            problem.add_fact(f"(clear {symbol})")
 
 
-def food_symbol(food_name: str) -> str:
-    """Return the symbol for a food, such as ``catalog_food_coconut_juice``."""
-    return pddl_name(food_name)
+def describe_vessels(kitchen: Kitchen, problem: ProblemBuilder) -> None:
+    """Declare plates and other portable equipment, and where they are."""
+    holds_food = set(kitchen.in_vessel.values())
+    for vessel in kitchen.vessels.values():
+        symbol = problem.add_object(vessel.symbol, "vessel")
+        problem.add_fact(f"(vkind {symbol} {equipment_symbol(vessel.name)})")
+        if vessel.plate:
+            problem.add_fact(f"(servable {symbol})")
+        if symbol not in holds_food:
+            problem.add_fact(f"(empty {symbol})")
+        _describe_place(kitchen, symbol, problem)
 
 
-def dish_symbol(food_name: str) -> str:
-    """Return the symbol for a plate holding ``food_name``.
-
-    For coconut juice this is ``plated_catalog_food_coconut_juice``.
-    """
-    return "plated_" + pddl_name(food_name)
-
-
-def location_symbol(tile: GameObject) -> str:
-    """Return the symbol for a tile's grid position, such as ``loc_2_0``.
-
-    The symbol is ``loc_{x}_{y}``. No two tiles share a position, so no two
-    share a symbol.
-    """
-    return f"loc_{tile.x}_{tile.y}"
+def describe_food(kitchen: Kitchen, problem: ProblemBuilder) -> None:
+    """Declare each piece of food, its kind and place, and storage tokens."""
+    for symbol, name in kitchen.foods.items():
+        problem.add_object(symbol, "food")
+        problem.add_fact(f"(kind {symbol} {kind_symbol(name)})")
+        if symbol in kitchen.in_vessel:
+            problem.add_fact(f"(in {symbol} {kitchen.in_vessel[symbol]})")
+        _describe_place(kitchen, symbol, problem)
+    for symbol, name in kitchen.tokens.items():
+        problem.add_object(symbol, "food")
+        problem.add_fact(f"(spawn {symbol} {kind_symbol(name)})")
 
 
-def pddl_name(value: str) -> str:
-    """Convert a kitchen name to a PDDL symbol.
+def describe_chefs(kitchen: Kitchen, problem: ProblemBuilder) -> None:
+    """Declare each chef, whether its hands are free, and what it can reach."""
+    holding = set(kitchen.held_by.values())
+    for symbol in kitchen.chefs:
+        problem.add_object(symbol, "chef")
+        if symbol not in holding:
+            problem.add_fact(f"(free {symbol})")
+        for slot in sorted(kitchen.reach.get(symbol, ())):
+            if not kitchen.slots[slot].blocked:
+                problem.add_fact(f"(reach {symbol} {slot})")
 
-    PDDL names may contain only letters, digits, ``-`` and ``_``, and must
-    start with a letter. Kitchen names such as ``catalog/food/coconut_juice``
-    contain ``/`` and cannot be used unchanged. This function converts names
-    to lower case, replaces each run of other characters with ``_`` and trims
-    ``_`` from both ends, so ``catalog/food/coconut_juice`` becomes
-    ``catalog_food_coconut_juice``.
 
-    Planners return names in lower case. Generating lower-case symbols ensures
-    that the returned names match those used for lookup in from_pddl.py.
+def describe_orders(kitchen: Kitchen, problem: ProblemBuilder) -> None:
+    """Add one goal per visible order, so repeated dishes are served twice."""
+    for symbol, dish in kitchen.orders.items():
+        problem.add_object(symbol, "order")
+        problem.add_fact(f"(dish {symbol} {kind_symbol(dish)})")
+        problem.add_goal(f"(served {symbol})")
 
-    ``ProblemBuilder.add_object`` raises ``ValueError`` for a name that still
-    violates these rules, such as one that starts with a digit.
-    """
-    return re.sub(r"[^0-9a-z_]+", "_", value.lower()).strip("_")
+
+def _describe_place(kitchen: Kitchen, item: str, problem: ProblemBuilder) -> None:
+    if item in kitchen.held_by:
+        chef = kitchen.held_by[item]
+        if chef in kitchen.chefs:
+            problem.add_fact(f"(holding {chef} {item})")
+    elif item in kitchen.on_slot:
+        slot = kitchen.on_slot[item]
+        if not kitchen.slots[slot].blocked:
+            problem.add_fact(f"(at {item} {slot})")
