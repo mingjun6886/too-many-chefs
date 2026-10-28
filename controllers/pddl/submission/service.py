@@ -14,7 +14,9 @@ and leaves everything else out of the problem:
   station on the route.
 - In an open kitchen each order gets its own lead chef, the one with the
   shortest walk to the stations it needs, so the problem splits into
-  independent parts (one per job) and stays small; spare chefs help. In a
+  nearly independent parts (one per job) and stays small; spare chefs
+  help. The only thing two jobs may share is a watched station, such as a
+  pan that burns what is left in it, which no plan leaves holding food. In a
   divided kitchen every job needs the whole brigade, and one order is
   planned at a time (two at once made Fast Downward's plans worse).
 - When no order passes these checks, one order is planned with every chef
@@ -175,6 +177,22 @@ class _Recipes:
         return seen
 
 
+def burns(
+    state: OvercookedState, kitchen: Kitchen, wanted: Collection[str]
+) -> set[tuple[str, str]]:
+    """Return the (equipment, food) pairs where food left too long is ruined.
+
+    Equipment that cooks by itself keeps cooking what is left in it, so food
+    it would turn into something no visible order wants burns there.
+    ``problem_generator`` states these as ``(burns ?e ?k)``.
+    """
+    return {
+        (recipe.equipment, recipe.ingredient)
+        for recipe in state.cook_recipes
+        if recipe.equipment in kitchen.self_cooking and recipe.output not in wanted
+    }
+
+
 def plan_service(kitchen: Kitchen, state: OvercookedState, attempt: int = 0) -> Service:
     """Choose the jobs for the next problem and what each one may use."""
     recipes = _Recipes(state)
@@ -233,15 +251,26 @@ class _Planner:
         self.pool: dict[str, list[str]] = defaultdict(list)
         for symbol, name in kitchen.foods.items():
             self.pool[name].append(symbol)
+        wanted = recipes.needed([order.dish for order in kitchen.orders])
+        # Watched stations: every wanted food made there burns if left, like
+        # the pan that burns a patty. The domain only lets a chef cook such
+        # food while watching it (cook_watch), so no plan leaves food in a
+        # watched station between steps and jobs may share it.
+        burning = burns(recipes.state, kitchen, wanted)
+        makes: dict[str, set[str]] = defaultdict(set)
+        for recipe in recipes.state.cook_recipes:
+            if recipe.output in wanted:
+                makes[recipe.equipment].add(recipe.output)
+        self.watched = {
+            station
+            for station, foods in makes.items()
+            if all((station, food) in burning for food in foods)
+        }
         # Plates whose food no visible order can use: a chef may bin it.
         # After two plans in a row went nowhere anything may be binned (as in
         # ``problem_generator.describe_kinds``), so a plate holding food that
         # got stuck there can be emptied too.
-        wanted = (
-            recipes.needed([order.dish for order in kitchen.orders])
-            if attempt < 2
-            else set()
-        )
+        keep = wanted if attempt < 2 else set()
         contents: dict[str, list[str | None]] = defaultdict(list)
         for item, vessel in kitchen.in_vessel.items():
             contents[vessel].append(kitchen.foods.get(item))
@@ -250,7 +279,7 @@ class _Planner:
             for vessel, names in contents.items()
             if vessel in kitchen.vessels
             and kitchen.vessels[vessel].plate
-            and all(name is not None and name not in wanted for name in names)
+            and all(name is not None and name not in keep for name in names)
         }
 
     # --- Which orders -------------------------------------------------------
@@ -285,7 +314,11 @@ class _Planner:
         Jobs never share a station: two orders going through one cutboard at
         once block each other, because a plan leaves food in a station while
         its chef does other work. An order whose route needs a station every
-        copy of which another job already uses waits for the next plan.
+        copy of which another job already uses waits for the next plan. The
+        exception is a watched station (see ``watched``): every wanted food
+        made there burns if left, so a chef only cooks it while watching and
+        takes it out at once. Who gets the station first is not decided by
+        deadline; the first chef to reach it uses it.
 
         The planner does not model walking, so who works where is decided
         here. The lead is the chef with the shortest walk to the stations the
@@ -302,7 +335,8 @@ class _Planner:
                 break
             whole = self._route(order.dish, reach, chefs, frozenset(), 0)
             if whole is None or any(
-                in_use[name] >= self._copies(name, reach) for name in whole.stations
+                in_use[name] >= self._copies(name, reach)
+                for name in whole.stations - self.watched
             ):
                 continue
             if self._assign(service, order, free, claimed):

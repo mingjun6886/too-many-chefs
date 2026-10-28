@@ -144,6 +144,9 @@ class Kitchen:
     reach: dict[str, set[str]] = field(default_factory=dict)
     # Walking distance from each chef to each slot it reaches.
     distance: dict[str, dict[str, int]] = field(default_factory=dict)
+    # Equipment that cooks by itself (timed cooking): food left in it keeps
+    # cooking.
+    self_cooking: set[str] = field(default_factory=set)
     # Order rules.
     strict: bool = False
     sequential: bool = False
@@ -209,6 +212,8 @@ def _read_kinds(
     equipment_names: list[str] = [PLATE_NAME]
     for equipment in environment.get_entities_of_type(Equipment):
         equipment_names.append(equipment.name)
+        if equipment.cooks_by_itself:
+            kitchen.self_cooking.add(equipment.name)
         if equipment.requires:
             equipment_names.append(equipment.requires)
     for name in equipment_names:

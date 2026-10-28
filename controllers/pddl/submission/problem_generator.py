@@ -34,7 +34,7 @@ from controllers.pddl.submission.kitchen import (
     kind_symbol,
     read_kitchen,
 )
-from controllers.pddl.submission.service import Service, plan_service
+from controllers.pddl.submission.service import Service, burns, plan_service
 from simulator.entities import Agent, Equipment, OvercookedState
 from simulator.entities.plate import PLATE_NAME
 from simulator.environment import Environment
@@ -211,20 +211,15 @@ def describe_kinds(
             problem.add_fact(f"(raw {symbol})")
         if name not in wanted or attempt >= 2:
             problem.add_fact(f"(waste {symbol})")
-    by_itself = {
-        entity.name
-        for entity in environment.get_entities_of_type(Equipment)
-        if entity.cooks_by_itself
-    }
+    burning = burns(state, kitchen, wanted)
     for recipe in state.cook_recipes:
         equipment = equipment_symbol(recipe.equipment)
         if equipment not in kitchen.equipment:
             continue
         if (
-            recipe.equipment in by_itself
-            and recipe.ingredient in names
-            and recipe.output not in wanted
-        ):
+            recipe.equipment,
+            recipe.ingredient,
+        ) in burning and recipe.ingredient in names:
             problem.add_fact(f"(burns {equipment} {kind_symbol(recipe.ingredient)})")
         if recipe.ingredient not in names or recipe.output not in names:
             continue
