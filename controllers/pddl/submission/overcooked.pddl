@@ -12,8 +12,9 @@
 ; (next ?v ?w).
 ;
 ; Jobs. The problem generator (service.py) splits the service into jobs, one
-; per planned order. A job has a crew, (crew ?j ?c), and the items it may
-; use, (owns ?j ?i), and the tiles it works at, (uses ?j ?s): the nearest
+; per planned order, plus at most one "prep" job with no order, whose goal
+; is a portion left in its cookware. A job has a crew, (crew ?j ?c), and the
+; items it may use, (owns ?j ?i), and the tiles it works at, (uses ?j ?s): the nearest
 ; storage of each ingredient, its own stations where the kitchen has
 ; several, a few counters. Every action names the job last and requires
 ; the chef to be in its crew, the slot to be in its workspace and every

@@ -2,8 +2,8 @@
 
 Planning every visible order at once makes problems that Fast Downward
 cannot ground in time. Instead, Python picks the next few orders ("jobs"),
-gives each job its own crew of chefs and its own food, plates and cookware,
-and leaves everything else out of the problem:
+gives each job its own crew of chefs and, as far as it can, its own food,
+plates and cookware, and leaves everything else out of the problem:
 
 - Orders are ranked by the kitchen's rules: under strict ordering or
   sequential reveal only the head of the queue can be served, so it is the
@@ -15,8 +15,10 @@ and leaves everything else out of the problem:
 - In an open kitchen each order gets its own lead chef, the one with the
   shortest walk to the stations it needs, so the problem splits into
   nearly independent parts (one per job) and stays small; spare chefs
-  help. The only thing two jobs may share is a watched station, such as a
-  pan that burns what is left in it, which no plan leaves holding food. In a
+  help. Jobs share a station only when it is a watched one (a pan that
+  burns what is left in it, which no plan leaves holding food) or when a
+  prep job uses the order's cookware; they may also share counters and
+  ``Service.shared`` items (food in hands, junk in the way). In a
   divided kitchen every job needs the whole brigade, and one order is
   planned at a time (two at once made Fast Downward's plans worse).
 - When no order passes these checks, one order is planned with every chef
@@ -258,8 +260,9 @@ class _Planner:
         wanted = recipes.needed([order.dish for order in kitchen.orders])
         # Watched stations: every wanted food made there burns if left, like
         # the pan that burns a patty. The domain only lets a chef cook such
-        # food while watching it (cook_watch), so no plan leaves food in a
-        # watched station between steps and jobs may share it.
+        # food while watching it (cook_watch); food put in another way would
+        # never cook, so plans do not leave food in a watched station between
+        # steps, and jobs may share it.
         burning = burns(recipes.state, kitchen, wanted)
         makes: dict[str, set[str]] = defaultdict(set)
         for recipe in recipes.state.cook_recipes:
@@ -884,7 +887,7 @@ class _Planner:
         near the kitchen's stations.
 
         Every job ranks counters by the same nearness to stations, so two
-        jobs may share a counter even though they never share a station.
+        jobs may share a counter, though they rarely share a station.
         """
         counters: dict[str, set[str]] = {}
         for job in service.jobs:
