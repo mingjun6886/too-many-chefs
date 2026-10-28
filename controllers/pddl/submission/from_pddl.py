@@ -4,10 +4,23 @@
 reads the same ``Kitchen`` as the problem generator, so every symbol in the
 plan maps back to a chef id, a tile, or a catalog name.
 
-Every action in overcooked.pddl names the chef first and the slot it acts on
-second; the slot's tile is where the chef acts. Each step becomes one
-mutation with its ``expected_*`` fields filled in from the step's own
-arguments, so a chef waits rather than acting on the wrong thing.
+Every action in overcooked.pddl names the chef first, the slot it acts on
+second and (except ``wait`` and ``stop``) the job last; the slot's tile is
+where the chef acts. A step becomes zero or more mutations with their
+``expected_*`` fields filled in from the step's own arguments, so a chef
+waits rather than acting on the wrong thing:
+
+- ``cook`` at a station that needs pressing becomes one Cook per step of its
+  cook time (fewer for food already part-way done); at a station that cooks
+  by itself it becomes nothing, and the next step that takes the food out
+  names the cooked food, so the chef waits there until it is ready.
+- ``wait`` becomes a few turns on the spot, so time passes; ``stop`` becomes
+  nothing at all.
+
+Every plan except a ``stop`` ends with a step that never becomes legal. The
+chef stands still on it, the kitchen stops moving, and ``should_replan``
+asks for the next plan. Without it, an empty queue would end the run while
+orders are still open.
 """
 
 from __future__ import annotations
@@ -16,6 +29,8 @@ from collections.abc import Callable
 
 from controllers.pddl.interfaces import FromPDDL, PDDLPlanStep
 from controllers.pddl.submission.kitchen import Kitchen, Slot, read_kitchen
+from simulator.entities import Agent, Equipment, Food, get_game_objects_of_type_at
+from simulator.entities.plate import PLATE_NAME
 from simulator.environment import Environment
 from simulator.mutations import (
     Combine,
@@ -26,8 +41,18 @@ from simulator.mutations import (
     PickUp,
     Place,
     TakeFromStorage,
+    TurnAgent,
+    Wash,
 )
 from simulator.mutations.agent_mutation import AgentMutation
+from simulator.mutations.cooking import cook_presses_left
+
+# Steps a ``wait`` lets pass.
+WAIT_STEPS = 3
+# Names no plate has, so the closing step never becomes legal.
+FINISHED = "(plan finished)"
+# Actions without a job parameter.
+_NO_JOB = {"wait", "stop"}
 
 
 class DefaultFromPDDL(FromPDDL):
@@ -36,6 +61,8 @@ class DefaultFromPDDL(FromPDDL):
     def __init__(self, environment: Environment) -> None:
         self._environment = environment
         self._kitchen: Kitchen | None = None
+        # Stations and vessels food was put into earlier in this plan.
+        self._filled: set[str] = set()
 
     @property
     def kitchen(self) -> Kitchen:
@@ -44,10 +71,16 @@ class DefaultFromPDDL(FromPDDL):
         return self._kitchen
 
     def from_pddl(self, steps: list[PDDLPlanStep]) -> list[MutationWithLocation]:
-        """Translate all steps in plan order."""
-        return [self.translate(step) for step in steps]
+        """Translate all steps in plan order, then close the plan."""
+        self._filled = set()
+        mutations: list[MutationWithLocation] = []
+        for step in steps:
+            mutations += self.translate(step)
+        if any(step.name == "stop" for step in steps):
+            return mutations
+        return [*mutations, self._closing_step(mutations)]
 
-    def translate(self, step: PDDLPlanStep) -> MutationWithLocation:
+    def translate(self, step: PDDLPlanStep) -> list[MutationWithLocation]:
         handler = _HANDLERS.get(step.name)
         if handler is None:
             raise ValueError(f"No translation for this action yet: {step}")
@@ -55,11 +88,49 @@ class DefaultFromPDDL(FromPDDL):
             raise ValueError(f"Step names no chef and slot: {step}")
         chef_id = self.chef_id(step.parameters[0])
         slot = self.slot(step.parameters[1])
+        args = step.parameters[2:]
+        if step.name not in _NO_JOB:
+            args = args[:-1]
         try:
-            mutation = handler(self, chef_id, slot, step.parameters[2:])
-        except (ValueError, KeyError) as error:
+            result = handler(self, chef_id, slot, tuple(args))
+        except (ValueError, KeyError, TypeError) as error:
             raise ValueError(f"Cannot translate {step}: {error}") from error
-        return MutationWithLocation(mutation=mutation, location=slot.location)
+        if step.name not in {"cook", "cook_vessel", "cook_watch", "cook_watch_vessel"}:
+            self._filled.add(slot.symbol)
+            self._filled.update(arg for arg in args if arg.startswith("v_"))
+        if isinstance(result, AgentMutation):
+            result = [result]
+        return [
+            MutationWithLocation(mutation=mutation, location=slot.location)
+            for mutation in result
+        ]
+
+    def _closing_step(
+        self, mutations: list[MutationWithLocation]
+    ) -> MutationWithLocation:
+        """Return a step that keeps a chef standing still until the replan."""
+        if mutations:
+            last = mutations[-1]
+            agent_id = getattr(last.mutation, "agent_id", None)
+            if agent_id is not None and last.location is not None:
+                return MutationWithLocation(
+                    mutation=Wash(
+                        agent_id=agent_id, expected_held_equipment_name=FINISHED
+                    ),
+                    location=last.location,
+                )
+        if not self.kitchen.chefs or not self.kitchen.slots:
+            raise ValueError("The kitchen has no chef or no tile to wait at")
+        chef = next(iter(self.kitchen.chefs))
+        distance = self.kitchen.distance.get(chef, {})
+        slot = min(self.kitchen.slots, key=lambda s: (distance.get(s, 10**6), s))
+        return MutationWithLocation(
+            mutation=Wash(
+                agent_id=self.kitchen.chefs[chef],
+                expected_held_equipment_name=FINISHED,
+            ),
+            location=self.kitchen.slots[slot].location,
+        )
 
     # --- Resolving symbols -----------------------------------------------------
 
@@ -88,6 +159,22 @@ class DefaultFromPDDL(FromPDDL):
             raise ValueError(f"Unknown vessel in plan: {symbol}")
         return self.kitchen.vessels[symbol].name
 
+    def _presses(self, station: Equipment | None, key: str, kind_in: str) -> int:
+        """Return how many Cook presses a station needs for ``kind_in``.
+
+        Zero for a station that cooks by itself; otherwise its cook time, or
+        what is left of it for food already part-way done.
+        """
+        if station is None:
+            return 1
+        if station.cooks_by_itself:
+            return 0
+        if key not in self._filled and station.held_item_id is not None:
+            held = self._environment.get_entity_as(station.held_item_id, Food)
+            if held is not None and held.name == kind_in:
+                return cook_presses_left(self._environment, station)
+        return station.cook_time
+
     # --- One method per action, given the arguments after chef and slot ----------
 
     def take(self, chef: str, slot: Slot, args: tuple[str, ...]) -> AgentMutation:
@@ -98,24 +185,38 @@ class DefaultFromPDDL(FromPDDL):
         )
 
     def take_into(self, chef: str, slot: Slot, args: tuple[str, ...]) -> AgentMutation:
-        _vessel, _ekind, _food, kind = args
+        vessel, _ekind, _food, kind = args
         name = self.food(kind)
         return TakeFromStorage(
-            agent_id=chef, expected_input_name=name, expected_output_name=name
+            agent_id=chef,
+            expected_input_name=name,
+            expected_held_equipment_name=self.vessel(vessel),
+            expected_output_name=name,
         )
 
     def take_mix(self, chef: str, slot: Slot, args: tuple[str, ...]) -> AgentMutation:
-        _vessel, _ekind, _food, _kg, kind, out = args
+        vessel, _ekind, _food, _kg, kind, out = args
         return TakeFromStorage(
             agent_id=chef,
             expected_input_name=self.food(kind),
+            expected_held_equipment_name=self.vessel(vessel),
             expected_output_name=self.food(out),
+        )
+
+    def take_plate(self, chef: str, slot: Slot, args: tuple[str, ...]) -> AgentMutation:
+        vessel, _next = args
+        return TakeFromStorage(
+            agent_id=chef,
+            expected_input_name=PLATE_NAME,
+            expected_output_name=self.vessel(vessel),
         )
 
     def pick_up(self, chef: str, slot: Slot, args: tuple[str, ...]) -> AgentMutation:
         _food, kind = args
         name = self.food(kind)
-        return PickUp(agent_id=chef, expected_input_name=name, expected_output_name=name)
+        return PickUp(
+            agent_id=chef, expected_input_name=name, expected_output_name=name
+        )
 
     def pick_up_vessel(
         self, chef: str, slot: Slot, args: tuple[str, ...]
@@ -142,8 +243,12 @@ class DefaultFromPDDL(FromPDDL):
         return Place(agent_id=chef, expected_held_equipment_name=self.vessel(vessel))
 
     def mount(self, chef: str, slot: Slot, args: tuple[str, ...]) -> AgentMutation:
-        vessel, _ekind, _base = args
-        return Place(agent_id=chef, expected_held_equipment_name=self.vessel(vessel))
+        vessel, _ekind, base = args
+        return Place(
+            agent_id=chef,
+            expected_held_equipment_name=self.vessel(vessel),
+            expected_target_equipment_name=self.equipment(base),
+        )
 
     def load(self, chef: str, slot: Slot, args: tuple[str, ...]) -> AgentMutation:
         ekind, _food, kind = args
@@ -283,25 +388,95 @@ class DefaultFromPDDL(FromPDDL):
             expected_output_name=self.food(out),
         )
 
-    def cook(self, chef: str, slot: Slot, args: tuple[str, ...]) -> AgentMutation:
+    def cook(self, chef: str, slot: Slot, args: tuple[str, ...]) -> list[AgentMutation]:
         ekind, _food, kind_in, kind_out = args
-        return Cook(
+        name = self.equipment(ekind)
+        station = next(
+            (
+                equipment
+                for equipment in get_game_objects_of_type_at(
+                    self._environment, *slot.location, Equipment
+                )
+                if not equipment.portable and equipment.name == name
+            ),
+            None,
+        )
+        presses = self._presses(station, slot.symbol, self.food(kind_in))
+        press = Cook(
             agent_id=chef,
             expected_held_food=self.food(kind_in),
-            expected_input_name=self.equipment(ekind),
+            expected_input_name=name,
             expected_output_name=self.food(kind_out),
         )
+        return [press] * presses
 
     def cook_vessel(
         self, chef: str, slot: Slot, args: tuple[str, ...]
-    ) -> AgentMutation:
+    ) -> list[AgentMutation]:
         vessel, _ekind, _base, _food, kind_in, kind_out = args
-        return Cook(
+        entity_id = (
+            self.kitchen.vessels[vessel].entity_id
+            if vessel in self.kitchen.vessels
+            else None
+        )
+        station = (
+            self._environment.get_entity_as(entity_id, Equipment)
+            if entity_id is not None
+            else None
+        )
+        presses = self._presses(station, vessel, self.food(kind_in))
+        press = Cook(
             agent_id=chef,
             expected_held_food=self.food(kind_in),
             expected_input_name=self.vessel(vessel),
             expected_output_name=self.food(kind_out),
         )
+        return [press] * presses
+
+    def cook_watch(
+        self, chef: str, slot: Slot, args: tuple[str, ...]
+    ) -> list[AgentMutation]:
+        """Pour into the station, then wait there and take the food back."""
+        ekind, plate, _food, kind_in, kind_out = args
+        station = self.equipment(ekind)
+        return [
+            Combine(
+                agent_id=chef,
+                expected_held_equipment_name=self.vessel(plate),
+                expected_held_equipment_contents_name=self.food(kind_in),
+                expected_target_equipment_name=station,
+                expected_output_name=self.food(kind_in),
+            ),
+            Combine(
+                agent_id=chef,
+                expected_held_equipment_name=self.vessel(plate),
+                expected_target_equipment_name=station,
+                expected_target_equipment_contents_name=self.food(kind_out),
+                expected_output_name=self.food(kind_out),
+            ),
+        ]
+
+    def cook_watch_vessel(
+        self, chef: str, slot: Slot, args: tuple[str, ...]
+    ) -> list[AgentMutation]:
+        """Pour into the pan or pot, then wait there and take the food back."""
+        plate, vessel, _ekind, _base, _food, kind_in, kind_out = args
+        return [
+            Combine(
+                agent_id=chef,
+                expected_held_equipment_name=self.vessel(plate),
+                expected_held_equipment_contents_name=self.food(kind_in),
+                expected_target_equipment_name=self.vessel(vessel),
+                expected_output_name=self.food(kind_in),
+            ),
+            Combine(
+                agent_id=chef,
+                expected_held_equipment_name=self.vessel(plate),
+                expected_target_equipment_name=self.vessel(vessel),
+                expected_target_equipment_contents_name=self.food(kind_out),
+                expected_output_name=self.food(kind_out),
+            ),
+        ]
 
     def deliver(self, chef: str, slot: Slot, args: tuple[str, ...]) -> AgentMutation:
         vessel, _food, kind, _order = args
@@ -328,6 +503,22 @@ class DefaultFromPDDL(FromPDDL):
             expected_held_equipment_contents_name=self.food(kind),
         )
 
+    def wash(self, chef: str, slot: Slot, args: tuple[str, ...]) -> AgentMutation:
+        (vessel,) = args
+        return Wash(agent_id=chef, expected_held_equipment_name=self.vessel(vessel))
+
+    def wait(self, chef: str, slot: Slot, args: tuple[str, ...]) -> list[AgentMutation]:
+        agent = self._environment.get_entity_as(chef, Agent)
+        if agent is None:
+            raise ValueError(f"Unknown chef {chef}")
+        return [
+            TurnAgent(agent_id=chef, orientation=agent.orientation)
+            for _ in range(WAIT_STEPS)
+        ]
+
+    def stop(self, chef: str, slot: Slot, args: tuple[str, ...]) -> list[AgentMutation]:
+        return []
+
 
 def _target_food(slot: Slot, food_name: str) -> dict[str, str]:
     """Return the expectations for food the chef faces on ``slot``.
@@ -343,7 +534,10 @@ def _target_food(slot: Slot, food_name: str) -> dict[str, str]:
     return {"expected_target_food_name": food_name}
 
 
-Handler = Callable[[DefaultFromPDDL, str, Slot, tuple[str, ...]], AgentMutation]
+Handler = Callable[
+    [DefaultFromPDDL, str, Slot, tuple[str, ...]],
+    AgentMutation | list[AgentMutation],
+]
 
 _HANDLERS: dict[str, Handler] = {
     name: getattr(DefaultFromPDDL, name)
@@ -351,6 +545,7 @@ _HANDLERS: dict[str, Handler] = {
         "take",
         "take_into",
         "take_mix",
+        "take_plate",
         "pick_up",
         "pick_up_vessel",
         "pick_up_full",
@@ -374,8 +569,13 @@ _HANDLERS: dict[str, Handler] = {
         "scoop_mix",
         "cook",
         "cook_vessel",
+        "cook_watch",
+        "cook_watch_vessel",
         "deliver",
         "discard",
         "discard_from",
+        "wash",
+        "wait",
+        "stop",
     )
 }

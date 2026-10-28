@@ -8,22 +8,21 @@ the symbols in a plan back into chef ids, tiles and catalog names.
 The model is instance-level: each chef, each tile a chef can act on, each
 piece of food, each plate or pan and each visible order is one PDDL object.
 Food keeps its identity while it is cooked or combined; its current kind is
-a fluent. Storages hand out new food, so each storage kind gets a few
-"token" food objects that do not exist yet, sized to what the orders could
-need.
+a fluent. Storages and plate dispensers hand out new things, which the
+problem describes as "tokens" that do not exist yet (see ``service.py``).
 
 Names:
 
-- chefs ``a_<id>``; tiles ``loc_<x>_<y>``; food ``f_<id>``; tokens
-  ``t_<kind>_<n>``; vessels (plates and other portable equipment)
-  ``v_<id>``; food kinds ``k_<name>``; equipment kinds ``e_<name>``; orders
-  ``o_<n>``.
+- chefs ``a_<id>``; tiles ``loc_<x>_<y>``; food ``f_<id>``; food tokens
+  ``t_<job>_<kind>_<n>``; vessels (plates and other portable equipment)
+  ``v_<id>``; plates still in a dispenser ``v_d<x>_<y>_<n>``; food kinds
+  ``k_<name>``; equipment kinds ``e_<name>``; orders ``o_<n>``; jobs
+  ``j_<n>``.
 """
 
 from __future__ import annotations
 
 import re
-from collections import Counter as Tally
 from collections import deque
 from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
@@ -39,13 +38,17 @@ from simulator.entities import (
     GameObject,
     OvercookedState,
     Plate,
+    PlateDispenser,
+    Sink,
     Storage,
 )
+from simulator.entities.plate import PLATE_NAME
 from simulator.environment import Environment
 from simulator.types import Location
 
-# Recipe trees are shallow; this only guards against cyclic recipes.
-_MAX_RECIPE_DEPTH = 16
+# How many plates of one dispenser the model can hand out in one plan.
+DISPENSER_TOKENS = 4
+_STEPS = ((1, 0), (-1, 0), (0, 1), (0, -1))
 
 
 def pddl_name(value: str) -> str:
@@ -70,7 +73,8 @@ def tile_symbol(location: Location) -> str:
 
 @dataclass
 class Slot:
-    """A tile a chef acts on: counter, station, storage, delivery or bin."""
+    """A tile a chef acts on: counter, station, storage, delivery, bin, sink
+    or plate dispenser."""
 
     symbol: str
     location: Location
@@ -81,6 +85,8 @@ class Slot:
     storage: str | None = None
     delivery: bool = False
     bin: bool = False
+    sink: bool = False
+    dispenser: bool = False
     # The symbol of the item on the tile, if the model can describe it.
     item: str | None = None
     # Whether something the model cannot describe occupies the tile.
@@ -92,21 +98,43 @@ class Vessel:
     """A portable piece of equipment: a plate, pan, pot or mixing bowl."""
 
     symbol: str
-    entity_id: str
+    entity_id: str | None
     name: str
     plate: bool
+    dirty: bool = False
+    # The base it works on (a stove for a pan), if any.
+    requires: str | None = None
+    # For a plate still in a dispenser: the dispenser's slot and its place
+    # in the stack (0 comes out first).
+    dispenser: str | None = None
+    position: int = 0
+
+
+@dataclass
+class Order:
+    symbol: str
+    dish: str
+    index: int
+    reward: int
+    # Last timestep it can be served, or None when it never expires.
+    deadline: int | None
+    # When a dish of this kind must be served for no order of it to expire.
+    # A delivery serves the first order in the queue with that dish, not the
+    # one a plan meant, so this is the earliest deadline among this order and
+    # the later ones for the same dish.
+    due: int | None = None
 
 
 @dataclass
 class Kitchen:
     chefs: dict[str, str] = field(default_factory=dict)  # symbol -> agent id
+    chef_tiles: dict[str, Location] = field(default_factory=dict)
     slots: dict[str, Slot] = field(default_factory=dict)
     vessels: dict[str, Vessel] = field(default_factory=dict)
     foods: dict[str, str] = field(default_factory=dict)  # symbol -> food name
-    tokens: dict[str, str] = field(default_factory=dict)  # symbol -> food name
     kinds: dict[str, str] = field(default_factory=dict)  # symbol -> food name
     equipment: dict[str, str] = field(default_factory=dict)  # symbol -> name
-    orders: dict[str, str] = field(default_factory=dict)  # symbol -> dish name
+    orders: list[Order] = field(default_factory=list)
     # Where each described item is: chef holding it, slot it sits on, or the
     # vessel it is in. Values are symbols.
     held_by: dict[str, str] = field(default_factory=dict)
@@ -114,9 +142,27 @@ class Kitchen:
     in_vessel: dict[str, str] = field(default_factory=dict)
     # Static reachability: chef symbol -> slot symbols it can act on.
     reach: dict[str, set[str]] = field(default_factory=dict)
+    # Walking distance from each chef to each slot it reaches.
+    distance: dict[str, dict[str, int]] = field(default_factory=dict)
+    # Order rules.
+    strict: bool = False
+    sequential: bool = False
+    timestep: int = 0
 
     def slot_at(self, location: Location) -> Slot | None:
         return self.slots.get(tile_symbol(location))
+
+    def place_of(self, item: str) -> str | None:
+        """Return the slot an item (or the vessel holding it) stands on."""
+        if item in self.in_vessel:
+            item = self.in_vessel[item]
+        return self.on_slot.get(item)
+
+    def holder_of(self, item: str) -> str | None:
+        """Return the chef holding an item, or the vessel holding it."""
+        if item in self.in_vessel:
+            item = self.in_vessel[item]
+        return self.held_by.get(item)
 
 
 def read_kitchen(
@@ -130,13 +176,13 @@ def read_kitchen(
     state = environment.get_first_entity_of_type(OvercookedState)
     if state is None:
         raise ValueError("The environment has no OvercookedState")
-    kitchen = Kitchen()
+    kitchen = Kitchen(timestep=environment.timestep)
     _read_kinds(environment, state, kitchen)
     _read_slots(environment, kitchen)
     _read_items(environment, kitchen)
+    _read_dispensers(environment, kitchen)
     _read_chefs(environment, controlled_agent_ids, kitchen)
     _read_orders(state, kitchen)
-    _read_tokens(state, kitchen)
     return kitchen
 
 
@@ -148,7 +194,9 @@ def _read_kinds(
 ) -> None:
     names: list[str] = list(state.food_definitions)
     names += [food.name for food in environment.get_entities_of_type(Food)]
-    names += [storage.food_name for storage in environment.get_entities_of_type(Storage)]
+    names += [
+        storage.food_name for storage in environment.get_entities_of_type(Storage)
+    ]
     names += list(state.visible_orders)
     for recipe in state.cook_recipes:
         names += [recipe.ingredient, recipe.output]
@@ -158,7 +206,7 @@ def _read_kinds(
         if name:
             kitchen.kinds.setdefault(kind_symbol(name), name)
 
-    equipment_names: list[str] = []
+    equipment_names: list[str] = [PLATE_NAME]
     for equipment in environment.get_entities_of_type(Equipment):
         equipment_names.append(equipment.name)
         if equipment.requires:
@@ -190,6 +238,12 @@ def _read_slots(environment: Environment, kitchen: Kitchen) -> None:
     for bin_ in environment.get_entities_of_type(Bin):
         if bin_.x is not None and bin_.y is not None:
             slot((bin_.x, bin_.y)).bin = True
+    for sink in environment.get_entities_of_type(Sink):
+        if sink.x is not None and sink.y is not None:
+            slot((sink.x, sink.y)).sink = True
+    for dispenser in environment.get_entities_of_type(PlateDispenser):
+        if dispenser.x is not None and dispenser.y is not None:
+            slot((dispenser.x, dispenser.y)).dispenser = True
     for equipment in environment.get_entities_of_type(Equipment):
         if equipment.portable or equipment.x is None or equipment.y is None:
             continue
@@ -230,29 +284,31 @@ def _read_items(environment: Environment, kitchen: Kitchen) -> None:
     for equipment in equipment_by_id.values():
         if not equipment.portable:
             continue
-        if isinstance(equipment, Plate) and equipment.dirty:
-            # Dirty plates need a sink; not modelled yet.
-            _block_tile_of(kitchen, equipment)
-            continue
         symbol = "v_" + pddl_name(equipment.id)
-        kitchen.vessels[symbol] = Vessel(
+        vessel = Vessel(
             symbol=symbol,
             entity_id=equipment.id,
             name=equipment.name,
             plate=isinstance(equipment, Plate),
+            dirty=isinstance(equipment, Plate) and equipment.dirty,
+            requires=equipment.requires,
         )
         if equipment.id in holder_of:
+            kitchen.vessels[symbol] = vessel
             kitchen.held_by[symbol] = "a_" + pddl_name(holder_of[equipment.id].id)
         elif equipment.x is not None and equipment.y is not None:
             tile = kitchen.slot_at((equipment.x, equipment.y))
             if tile is None or tile.item is not None:
-                del kitchen.vessels[symbol]
+                if tile is not None:
+                    tile.blocked = True
                 continue
+            kitchen.vessels[symbol] = vessel
             tile.item = symbol
             kitchen.on_slot[symbol] = tile.symbol
 
     for food in environment.get_entities_of_type(Food):
         symbol = "f_" + pddl_name(food.id)
+        kitchen.kinds.setdefault(kind_symbol(food.name), food.name)
         if food.id in holder_of:
             kitchen.foods[symbol] = food.name
             kitchen.held_by[symbol] = "a_" + pddl_name(holder_of[food.id].id)
@@ -265,7 +321,11 @@ def _read_items(environment: Environment, kitchen: Kitchen) -> None:
                 kitchen.in_vessel[symbol] = vessel
             continue
         location: Location | None = None
-        if container is not None and container.x is not None and container.y is not None:
+        if (
+            container is not None
+            and container.x is not None
+            and container.y is not None
+        ):
             location = (container.x, container.y)
         elif food.id in counters_by_item:
             counter = counters_by_item[food.id]
@@ -275,18 +335,39 @@ def _read_items(environment: Environment, kitchen: Kitchen) -> None:
             continue
         tile = kitchen.slot_at(location)
         if tile is None or tile.item is not None:
+            if tile is not None:
+                tile.blocked = True
             continue
         kitchen.foods[symbol] = food.name
         tile.item = symbol
         kitchen.on_slot[symbol] = tile.symbol
 
 
-def _block_tile_of(kitchen: Kitchen, item: GameObject) -> None:
-    if item.x is None or item.y is None:
-        return
-    tile = kitchen.slot_at((item.x, item.y))
-    if tile is not None:
-        tile.blocked = True
+def _read_dispensers(environment: Environment, kitchen: Kitchen) -> None:
+    """Describe the plates still stacked in each dispenser, clean ones first."""
+    for dispenser in environment.get_entities_of_type(PlateDispenser):
+        if dispenser.x is None or dispenser.y is None:
+            continue
+        tile = kitchen.slot_at((dispenser.x, dispenser.y))
+        if tile is None:
+            continue
+        if dispenser.infinite_supply:
+            stack = [False] * DISPENSER_TOKENS
+        else:
+            stack = [False] * dispenser.plate_count + [
+                True
+            ] * dispenser.dirty_plate_count
+        for position, dirty in enumerate(stack[:DISPENSER_TOKENS]):
+            symbol = f"v_d{dispenser.x}_{dispenser.y}_{position}"
+            kitchen.vessels[symbol] = Vessel(
+                symbol=symbol,
+                entity_id=None,
+                name=PLATE_NAME,
+                plate=True,
+                dirty=dirty,
+                dispenser=tile.symbol,
+                position=position,
+            )
 
 
 # --- Chefs --------------------------------------------------------------------
@@ -306,15 +387,21 @@ def _read_chefs(
             continue
         symbol = "a_" + pddl_name(agent.id)
         kitchen.chefs[symbol] = agent.id
-        floor = _reachable_floor(blocked, inside, (agent.x, agent.y))
-        kitchen.reach[symbol] = {
-            tile.symbol
-            for tile in kitchen.slots.values()
-            if any(
-                (tile.location[0] + dx, tile.location[1] + dy) in floor
-                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1))
-            )
-        }
+        kitchen.chef_tiles[symbol] = (agent.x, agent.y)
+        floor = _floor_distances(blocked, inside, (agent.x, agent.y))
+        reach: set[str] = set()
+        distance: dict[str, int] = {}
+        for tile in kitchen.slots.values():
+            steps = [
+                floor[(tile.location[0] + dx, tile.location[1] + dy)]
+                for dx, dy in _STEPS
+                if (tile.location[0] + dx, tile.location[1] + dy) in floor
+            ]
+            if steps:
+                reach.add(tile.symbol)
+                distance[tile.symbol] = min(steps)
+        kitchen.reach[symbol] = reach
+        kitchen.distance[symbol] = distance
 
 
 def _blocked_tiles(environment: Environment) -> set[Location]:
@@ -351,78 +438,52 @@ def _inside(environment: Environment) -> Callable[[int, int], bool]:
     return lambda x, y: low_x <= x <= high_x and low_y <= y <= high_y
 
 
-def _reachable_floor(
+def _floor_distances(
     blocked: set[Location], inside: Callable[[int, int], bool], start: Location
-) -> set[Location]:
-    seen = {start}
+) -> dict[Location, int]:
+    """Return the walking distance to every floor tile reachable from start."""
+    seen = {start: 0}
     queue = deque([start])
     while queue:
         x, y = queue.popleft()
-        for step in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+        for dx, dy in _STEPS:
+            step = (x + dx, y + dy)
             if step in seen or step in blocked or not inside(*step):
                 continue
-            seen.add(step)
+            seen[step] = seen[(x, y)] + 1
             queue.append(step)
     return seen
 
 
-# --- Orders and storage tokens -----------------------------------------------
+# --- Orders ---------------------------------------------------------------------
 
 
 def _read_orders(state: OvercookedState, kitchen: Kitchen) -> None:
-    for index, dish in enumerate(state.visible_orders):
-        kitchen.orders[f"o_{index}"] = dish
-
-
-def _read_tokens(state: OvercookedState, kitchen: Kitchen) -> None:
-    """Give each storage kind enough not-yet-existing food for the orders."""
-    stored = {tile.storage for tile in kitchen.slots.values() if tile.storage}
-    if not stored:
-        return
-    memo: dict[str, Tally[str]] = {}
-    need: Tally[str] = Tally()
-    for dish in kitchen.orders.values():
-        need.update(_leaf_counts(state, dish, stored, memo, frozenset()))
-    for food_name in sorted(stored):
-        for index in range(need.get(food_name, 0)):
-            kitchen.tokens[f"t_{pddl_name(food_name)}_{index}"] = food_name
-
-
-def _leaf_counts(
-    state: OvercookedState,
-    dish: str,
-    stored: set[str],
-    memo: dict[str, Tally[str]],
-    visiting: frozenset[str],
-) -> Tally[str]:
-    """Count the storage pulls of each kind that making ``dish`` can take.
-
-    Alternative recipes for the same food are combined with an elementwise
-    maximum, so whichever route the planner picks has enough tokens.
-    """
-    if dish in memo:
-        return memo[dish]
-    if dish in visiting or len(visiting) > _MAX_RECIPE_DEPTH:
-        return Tally()
-    visiting = visiting | {dish}
-    routes: list[Tally[str]] = []
-    if dish in stored:
-        routes.append(Tally({dish: 1}))
-    for recipe in state.cook_recipes:
-        if recipe.output == dish:
-            routes.append(_leaf_counts(state, recipe.ingredient, stored, memo, visiting))
-    for recipe in state.combine_recipes:
-        if recipe.output == dish:
-            ingredients = list(recipe.ingredients)
-            if len(ingredients) == 1:
-                ingredients *= 2
-            total: Tally[str] = Tally()
-            for ingredient in ingredients:
-                total.update(_leaf_counts(state, ingredient, stored, memo, visiting))
-            routes.append(total)
-    result: Tally[str] = Tally()
-    for route in routes:
-        for name, count in route.items():
-            result[name] = max(result[name], count)
-    memo[dish] = result
-    return result
+    queue = state.order_queue
+    kitchen.strict = bool(queue.strict_ordering)
+    kitchen.sequential = queue.order_reveal == "sequential"
+    for index, entry in enumerate(queue.visible):
+        deadline = (
+            entry.revealed_at + entry.time_limit
+            if entry.time_limit is not None
+            else None
+        )
+        kitchen.orders.append(
+            Order(
+                symbol=f"o_{index}",
+                dish=entry.name,
+                index=index,
+                reward=entry.reward,
+                deadline=deadline,
+            )
+        )
+    # The k-th delivery of a dish serves the k-th order for it in the queue,
+    # so it must arrive by the earliest deadline from that order on.
+    earliest: dict[str, int] = {}
+    for order in reversed(kitchen.orders):
+        due = earliest.get(order.dish)
+        if order.deadline is not None and (due is None or order.deadline < due):
+            due = order.deadline
+        if due is not None:
+            earliest[order.dish] = due
+        order.due = due
