@@ -34,7 +34,7 @@ from controllers.pddl.submission.kitchen import (
     kind_symbol,
     read_kitchen,
 )
-from controllers.pddl.submission.service import Service, burns, plan_service
+from controllers.pddl.submission.service import Service, burns, needed, plan_service
 from simulator.entities import Agent, Equipment, OvercookedState
 from simulator.entities.plate import PLATE_NAME
 from simulator.environment import Environment
@@ -202,9 +202,7 @@ def describe_kinds(
     cooking by itself would turn into waste burns there if left too long.
     """
     names = service.kinds
-    wanted: set[str] = set()
-    for order in kitchen.orders:
-        wanted |= _ancestors(state, order.dish)
+    wanted = needed(state, [order.dish for order in kitchen.orders])
     for name in sorted(names):
         symbol = problem.add_object(kind_symbol(name), "fkind")
         if state.is_raw_food(name):
@@ -254,9 +252,7 @@ def describe_equipment(
     what the recipes let it take; illegal recipes are never planned.
     """
     entities = environment.get_entities_of_type(Equipment)
-    dishes = set()
-    for job in service.jobs:
-        dishes |= _ancestors(state, job.target)
+    dishes = needed(state, [job.target for job in service.jobs])
     for symbol, name in kitchen.equipment.items():
         problem.add_object(symbol, "ekind")
         for food_name in sorted(service.kinds):
@@ -408,23 +404,6 @@ def _describe_place(
         problem.add_fact(f"(holding {kitchen.held_by[item]} {item})")
     elif item in kitchen.on_slot:
         problem.add_fact(f"(at {item} {kitchen.on_slot[item]})")
-
-
-def _ancestors(state: OvercookedState, dish: str) -> set[str]:
-    seen: set[str] = set()
-    stack = [dish]
-    while stack:
-        name = stack.pop()
-        if name in seen:
-            continue
-        seen.add(name)
-        for recipe in state.cook_recipes:
-            if recipe.output == name:
-                stack.append(recipe.ingredient)
-        for recipe in state.combine_recipes:
-            if recipe.output == name:
-                stack += list(recipe.ingredients)
-    return seen
 
 
 def _accepts(

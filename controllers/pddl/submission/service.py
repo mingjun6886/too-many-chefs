@@ -140,26 +140,8 @@ class _Recipes:
                     (ingredients[0], ingredients[1])
                 )
 
-    def needed(self, dishes: list[str]) -> set[str]:
-        """Return every food any recipe could put into ``dishes``, and them.
-
-        Like ``ancestors`` but through recipes of any size: this is the food
-        ``problem_generator`` does not mark as waste.
-        """
-        seen: set[str] = set()
-        stack = list(dishes)
-        while stack:
-            name = stack.pop()
-            if name in seen:
-                continue
-            seen.add(name)
-            for recipe in self.state.cook_recipes:
-                if recipe.output == name:
-                    stack.append(recipe.ingredient)
-            for recipe in self.state.combine_recipes:
-                if recipe.output == name:
-                    stack += list(recipe.ingredients)
-        return seen
+    def needed(self, dishes: Collection[str]) -> set[str]:
+        return needed(self.state, dishes)
 
     def ancestors(self, dish: str) -> set[str]:
         """Return every food that can go into making ``dish``, and the dish."""
@@ -175,6 +157,28 @@ class _Recipes:
             for first, second in self.combined_from.get(name, ()):
                 stack += [first, second]
         return seen
+
+
+def needed(state: OvercookedState, dishes: Collection[str]) -> set[str]:
+    """Return every food any recipe could put into ``dishes``, and them.
+
+    Like ``_Recipes.ancestors`` but through recipes of any size: this is the
+    food the problem does not mark as waste.
+    """
+    seen: set[str] = set()
+    stack = list(dishes)
+    while stack:
+        name = stack.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        for recipe in state.cook_recipes:
+            if recipe.output == name:
+                stack.append(recipe.ingredient)
+        for recipe in state.combine_recipes:
+            if recipe.output == name:
+                stack += list(recipe.ingredients)
+    return seen
 
 
 def burns(
@@ -788,41 +792,12 @@ class _Planner:
     # --- Everything else in the problem ---------------------------------------
 
     def finish(self, service: Service) -> None:
+        """Describe the rest of the problem: shared items, tiles and kinds."""
         kitchen = self.kitchen
+        described = self._share_items(service)
         crews = {chef for job in service.jobs for chef in job.crew}
-        owned = {item for job in service.jobs for item in job.items}
-        # What crew chefs hold is theirs to use or get rid of.
-        for item, chef in kitchen.held_by.items():
-            if chef in crews and item not in owned:
-                service.shared.add(item)
-        for item, vessel in kitchen.in_vessel.items():
-            if kitchen.held_by.get(vessel) in crews and item not in owned:
-                service.shared.add(item)
-        # Food in an owned vessel comes with it.
-        described = owned | service.shared
-        for item, vessel in kitchen.in_vessel.items():
-            if vessel in described and item not in described:
-                service.shared.add(item)
-        described = owned | service.shared
         reach = set().union(*(kitchen.reach[chef] for chef in crews))
-
-        slots: set[str] = set()
-        for symbol in reach:
-            slot = kitchen.slots[symbol]
-            if slot.blocked:
-                continue
-            if slot.item is not None:
-                if slot.item not in described:
-                    # Junk in a station is in the way: anyone may bin it.
-                    if slot.equipment is not None and slot.item in kitchen.foods:
-                        service.shared.add(slot.item)
-                        described.add(slot.item)
-                    else:
-                        continue
-                slots.add(symbol)
-            elif not slot.counter:
-                slots.add(symbol)
-        # A few empty counters for each job, near its chefs and its stations.
+        slots = self._occupied_slots(service, reach, described)
         empty = [
             symbol
             for symbol in reach
@@ -835,30 +810,10 @@ class _Planner:
             for s in reach
             if kitchen.slots[s].equipment is not None
         ]
-        counters: dict[str, set[str]] = {}
-        for job in service.jobs:
-            job_reach = set().union(*(kitchen.reach[chef] for chef in job.crew))
-            mine = [s for s in empty if s in job_reach]
-            near_chef = sorted(mine, key=lambda s: (self._distance(s, job.crew), s))
-            near_work = sorted(
-                mine, key=lambda s: (_near(kitchen.slots[s].location, stations), s)
-            )
-            counters[job.symbol] = set(near_chef[: COUNTERS_PER_JOB - 1])
-            counters[job.symbol] |= set(near_work[:COUNTERS_PER_JOB])
-            slots |= counters[job.symbol]
-        # Counters where the parts of a divided kitchen meet.
-        groups: dict[frozenset[str], list[str]] = defaultdict(list)
-        for symbol in empty:
-            sharing = frozenset(
-                frozenset(kitchen.reach[chef])
-                for chef in crews
-                if symbol in kitchen.reach[chef]
-            )
-            if len(sharing) > 1:
-                groups[sharing].append(symbol)
-        for group in groups.values():
-            group.sort(key=lambda s: (_near(kitchen.slots[s].location, stations), s))
-            slots.update(group[:HANDOFF_COUNTERS])
+        counters = self._counters(service, empty, stations)
+        for chosen in counters.values():
+            slots |= chosen
+        slots |= self._handoffs(crews, empty, stations)
         load: Tally[str] = Tally()
         for job in service.jobs:
             if job.local:
@@ -868,14 +823,113 @@ class _Planner:
             else:
                 job.slots = set(slots)
         service.slots = slots
+        service.kinds = self._kinds(service, described)
 
+    def _share_items(self, service: Service) -> set[str]:
+        """Add what every job may touch to ``service.shared``.
+
+        What crew chefs hold is theirs to use or get rid of, and food in a
+        described vessel comes with it. Returns every item the problem
+        describes.
+        """
+        kitchen = self.kitchen
+        crews = {chef for job in service.jobs for chef in job.crew}
+        owned = {item for job in service.jobs for item in job.items}
+        for item, chef in kitchen.held_by.items():
+            if chef in crews and item not in owned:
+                service.shared.add(item)
+        for item, vessel in kitchen.in_vessel.items():
+            if kitchen.held_by.get(vessel) in crews and item not in owned:
+                service.shared.add(item)
+        described = owned | service.shared
+        for item, vessel in kitchen.in_vessel.items():
+            if vessel in described and item not in described:
+                service.shared.add(item)
+        return owned | service.shared
+
+    def _occupied_slots(
+        self, service: Service, reach: set[str], described: set[str]
+    ) -> set[str]:
+        """Return the tiles in reach that are not bare counters or hold a
+        described item.
+
+        Junk in a station is in the way, so anyone may bin it: it joins
+        ``service.shared`` and ``described``.
+        """
+        kitchen = self.kitchen
+        slots: set[str] = set()
+        for symbol in reach:
+            slot = kitchen.slots[symbol]
+            if slot.blocked:
+                continue
+            if slot.item is not None:
+                if slot.item not in described:
+                    if slot.equipment is not None and slot.item in kitchen.foods:
+                        service.shared.add(slot.item)
+                        described.add(slot.item)
+                    else:
+                        continue
+                slots.add(symbol)
+            elif not slot.counter:
+                slots.add(symbol)
+        return slots
+
+    def _counters(
+        self,
+        service: Service,
+        empty: list[str],
+        stations: list[tuple[int, int]],
+    ) -> dict[str, set[str]]:
+        """Return a few empty counters for each job: near its chefs and
+        near the kitchen's stations.
+
+        Every job ranks counters by the same nearness to stations, so two
+        jobs may share a counter even though they never share a station.
+        """
+        counters: dict[str, set[str]] = {}
+        for job in service.jobs:
+            job_reach = set().union(*(self.kitchen.reach[chef] for chef in job.crew))
+            mine = [s for s in empty if s in job_reach]
+            near_chef = sorted(mine, key=lambda s: (self._distance(s, job.crew), s))
+            near_work = sorted(
+                mine, key=lambda s: (_near(self.kitchen.slots[s].location, stations), s)
+            )
+            counters[job.symbol] = set(near_chef[: COUNTERS_PER_JOB - 1])
+            counters[job.symbol] |= set(near_work[:COUNTERS_PER_JOB])
+        return counters
+
+    def _handoffs(
+        self, crews: set[str], empty: list[str], stations: list[tuple[int, int]]
+    ) -> set[str]:
+        """Return a few empty counters where the parts of a divided kitchen
+        meet, nearest the stations first."""
+        groups: dict[frozenset[str], list[str]] = defaultdict(list)
+        for symbol in empty:
+            sharing = frozenset(
+                frozenset(self.kitchen.reach[chef])
+                for chef in crews
+                if symbol in self.kitchen.reach[chef]
+            )
+            if len(sharing) > 1:
+                groups[sharing].append(symbol)
+        handoffs: set[str] = set()
+        for group in groups.values():
+            group.sort(
+                key=lambda s: (_near(self.kitchen.slots[s].location, stations), s)
+            )
+            handoffs.update(group[:HANDOFF_COUNTERS])
+        return handoffs
+
+    def _kinds(self, service: Service, described: set[str]) -> set[str]:
+        """Return the food kinds the problem needs: every food that can go
+        into a job's dish, and the kinds of the described food."""
         kinds: set[str] = set()
         for job in service.jobs:
             kinds |= self.recipes.ancestors(job.target)
         for item in described:
-            if item in kitchen.foods:
-                kinds.add(kitchen.foods[item])
-        service.kinds = kinds
+            if item in self.kitchen.foods:
+                kinds.add(self.kitchen.foods[item])
+        return kinds
 
     def _workspace(
         self,
