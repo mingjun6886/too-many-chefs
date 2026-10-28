@@ -13,7 +13,10 @@ waits rather than acting on the wrong thing:
 - ``cook`` at a station that needs pressing becomes one Cook per step of its
   cook time (fewer for food already part-way done); at a station that cooks
   by itself it becomes nothing, and the next step that takes the food out
-  names the cooked food, so the chef waits there until it is ready.
+  names the cooked food, so the chef waits there until it is ready. The
+  presses go to the chef who put the food on the station earlier in the
+  plan: the planner does not model walking, so it may hand them to a chef
+  on the far side of the kitchen while the one at the station stands idle.
 - ``wait`` becomes a few turns on the spot, so time passes; ``stop`` becomes
   nothing at all.
 
@@ -63,6 +66,8 @@ class DefaultFromPDDL(FromPDDL):
         self._kitchen: Kitchen | None = None
         # Stations and vessels food was put into earlier in this plan.
         self._filled: set[str] = set()
+        # The chef who last put food on each station in this plan.
+        self._loaders: dict[str, str] = {}
 
     @property
     def kitchen(self) -> Kitchen:
@@ -73,6 +78,7 @@ class DefaultFromPDDL(FromPDDL):
     def from_pddl(self, steps: list[PDDLPlanStep]) -> list[MutationWithLocation]:
         """Translate all steps in plan order, then close the plan."""
         self._filled = set()
+        self._loaders = {}
         mutations: list[MutationWithLocation] = []
         for step in steps:
             mutations += self.translate(step)
@@ -88,6 +94,10 @@ class DefaultFromPDDL(FromPDDL):
             raise ValueError(f"Step names no chef and slot: {step}")
         chef_id = self.chef_id(step.parameters[0])
         slot = self.slot(step.parameters[1])
+        if step.name in {"load", "load_mix", "pour_station"}:
+            self._loaders[slot.symbol] = chef_id
+        elif step.name == "cook":
+            chef_id = self._loaders.get(slot.symbol, chef_id)
         args = step.parameters[2:]
         if step.name not in _NO_JOB:
             args = args[:-1]

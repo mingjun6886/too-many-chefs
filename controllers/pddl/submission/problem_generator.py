@@ -261,7 +261,7 @@ def describe_equipment(
     entities = environment.get_entities_of_type(Equipment)
     dishes = set()
     for job in service.jobs:
-        dishes |= _ancestors(state, job.order.dish)
+        dishes |= _ancestors(state, job.target)
     for symbol, name in kitchen.equipment.items():
         problem.add_object(symbol, "ekind")
         for food_name in sorted(service.kinds):
@@ -347,6 +347,9 @@ def describe_food(kitchen: Kitchen, service: Service, problem: ProblemBuilder) -
         for symbol, name in job.tokens.items():
             problem.add_object(symbol, "food")
             problem.add_fact(f"(spawn {symbol} {kind_symbol(name)})")
+        if job.prep is not None:
+            problem.add_object(job.prep.token, "food")
+            problem.add_fact(f"(spawn {job.prep.token} {kind_symbol(job.prep.raw)})")
 
 
 def describe_chefs(kitchen: Kitchen, service: Service, problem: ProblemBuilder) -> None:
@@ -366,20 +369,27 @@ def describe_chefs(kitchen: Kitchen, service: Service, problem: ProblemBuilder) 
 def describe_jobs(kitchen: Kitchen, service: Service, problem: ProblemBuilder) -> None:
     """Declare each job: its crew, what it owns, and its order as a goal.
 
-    No chef may end a plan holding cookware: the controller would never
-    replan after it.
+    A prep job has no order: its goal is the portion, cooked, in its
+    cookware. No chef may end a plan holding cookware: the controller would
+    never replan after it.
     """
     for job in service.jobs:
         symbol = problem.add_object(job.symbol, "job")
-        order = problem.add_object(job.order.symbol, "order")
-        problem.add_fact(f"(aim {symbol} {order})")
-        problem.add_fact(f"(dish {order} {kind_symbol(job.order.dish)})")
-        problem.add_goal(f"(served {order})")
+        if job.order is not None:
+            order = problem.add_object(job.order.symbol, "order")
+            problem.add_fact(f"(aim {symbol} {order})")
+            problem.add_fact(f"(dish {order} {kind_symbol(job.order.dish)})")
+            problem.add_goal(f"(served {order})")
         for chef in job.crew:
             problem.add_fact(f"(crew {symbol} {chef})")
         for slot in sorted(job.slots & service.slots):
             problem.add_fact(f"(uses {symbol} {slot})")
-        for item in sorted(job.items | service.shared | set(job.tokens)):
+        owned = job.items | service.shared | set(job.tokens)
+        if job.prep is not None:
+            owned.add(job.prep.token)
+            problem.add_goal(f"(kind {job.prep.token} {kind_symbol(job.prep.food)})")
+            problem.add_goal(f"(in {job.prep.token} {job.prep.vessel})")
+        for item in sorted(owned):
             problem.add_fact(f"(owns {symbol} {item})")
     crews = {chef for job in service.jobs for chef in job.crew}
     for vessel in kitchen.vessels.values():
