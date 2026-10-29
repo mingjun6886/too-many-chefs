@@ -16,18 +16,14 @@ plates and cookware, and leaves everything else out of the problem:
   shortest walk to the stations it needs, so the problem splits into
   nearly independent parts (one per job) and stays small; spare chefs
   help. Jobs share a station only when it is a watched one (a pan that
-  burns what is left in it, which no plan leaves holding food) or when a
-  prep job uses the order's cookware; they may also share counters and
-  ``Service.shared`` items (food in hands, junk in the way). In a
+  burns what is left in it, which no plan leaves holding food); they may
+  also share counters and ``Service.shared`` items (food in hands, junk in
+  the way). In a
   divided kitchen every job needs the whole brigade, and one order is
   planned at a time (two at once made Fast Downward's plans worse).
 - When no order passes these checks, one order is planned with every chef
   and every item before the service waits or stops, since the checks are
   stricter than the domain.
-- When tickets are revealed one at a time in an open kitchen, the next one
-  cannot be started early, so a spare chef gets a "prep" job instead: leave
-  one portion of an ingredient several dishes share (cooked rice, say) in
-  the cookware that makes it.
 - When the previous plan stalled without moving the kitchen, ``attempt``
   rises and the next problem plans a single order with every chef, cycling
   through the orders, so one impossible order cannot block the others.
@@ -63,24 +59,9 @@ _INFINITY = 10**6
 
 
 @dataclass
-class Prep:
-    """A portion a prep job makes ahead: ``raw`` cooked into ``food``.
-
-    ``token`` is the food a storage hands out for it, and the portion ends
-    the plan in ``vessel``, the cookware that cooks it.
-    """
-
-    token: str
-    raw: str
-    food: str
-    vessel: str
-
-
-@dataclass
 class Job:
     symbol: str
-    # The order the job serves; None for a prep job.
-    order: Order | None
+    order: Order
     crew: list[str]
     # Items (food and vessels) only this job may use.
     items: set[str] = field(default_factory=set)
@@ -91,16 +72,6 @@ class Job:
     local: bool = False
     # The tiles the job may act on.
     slots: set[str] = field(default_factory=set)
-    # For a prep job: the portion to leave ready for a later ticket.
-    prep: Prep | None = None
-
-    @property
-    def target(self) -> str:
-        """Return the food the job works towards."""
-        if self.order is not None:
-            return self.order.dish
-        assert self.prep is not None
-        return self.prep.food
 
 
 @dataclass
@@ -235,13 +206,6 @@ def plan_service(kitchen: Kitchen, state: OvercookedState, attempt: int = 0) -> 
         )
         service.rest = "wait" if pending and chefs else "stop"
         return service
-    if (
-        kitchen.sequential
-        and attempt == 0
-        and len(service.jobs) == 1
-        and planner.open_kitchen()
-    ):
-        planner.add_prep(service)
     planner.finish(service)
     return service
 
@@ -538,68 +502,6 @@ class _Planner:
                 job.tokens[f"t_{job.symbol[2:]}_{_short(name)}_{index}"] = name
         service.jobs.append(job)
         return True
-
-    def add_prep(self, service: Service) -> None:
-        """Move a spare chef to a prep job: a portion ready for later tickets.
-
-        Under sequential reveal only the current ticket is known. The
-        portion is something the recipes combine in two or more ways,
-        cooked from a storage food in portable cookware that cooks nothing
-        else, and nothing cooks it any further: it keeps in that cookware
-        until a later ticket uses it and never blocks another dish. The most
-        widely used such ingredient wins; ties go by name.
-
-        The chef is the crew member holding nothing, other than the lead,
-        standing nearest that storage, so its only steps are the prep. (A
-        chef holding something the order's job owns could not put it down.)
-        Its queue runs on its own, so it may fill the cookware before the
-        order does; the order then waits for the next plan, which finds the
-        portion and uses it. A crew with no such chef has no prep. Only open
-        kitchens get one, so the chef reaches the storage and the cookware.
-        """
-        job = service.jobs[0]
-        holding = set(self.kitchen.held_by.values())
-        spare = [chef for chef in job.crew[1:] if chef not in holding]
-        if not spare:
-            return
-        reach = set().union(*(self.kitchen.reach[chef] for chef in job.crew))
-        uses: Tally[str] = Tally()
-        for recipe in self.recipes.state.combine_recipes:
-            uses.update(set(recipe.ingredients))
-        cooked_further = {
-            recipe.ingredient for recipe in self.recipes.state.cook_recipes
-        }
-        options: list[tuple[int, str, str, str]] = []
-        for food in self.recipes.ancestors(job.target):
-            if uses[food] < 2 or food in cooked_further:
-                continue
-            for raw, station in self.recipes.cooked_from.get(food, ()):
-                if not any(self.kitchen.slots[s].storage == raw for s in reach):
-                    continue
-                if any(
-                    recipe.equipment == station and recipe.output != food
-                    for recipe in self.recipes.state.cook_recipes
-                ):
-                    continue
-                vessel = self._cookware(station, reach, job.crew)
-                if vessel is not None:
-                    options.append((-uses[food], food, raw, vessel))
-        if not options:
-            return
-        _, food, raw, vessel = min(options)
-        storages = [s for s in reach if self.kitchen.slots[s].storage == raw]
-        chef = min(spare, key=lambda c: (self._distance_to(c, storages), c))
-        job.crew.remove(chef)
-        symbol = f"j_{len(service.jobs)}"
-        prep = Prep(
-            token=f"t_{symbol[2:]}_prep_{_short(raw)}",
-            raw=raw,
-            food=food,
-            vessel=vessel,
-        )
-        service.jobs.append(
-            Job(symbol=symbol, order=None, crew=[chef], items={vessel}, prep=prep)
-        )
 
     def _route(
         self,
@@ -937,7 +839,7 @@ class _Planner:
         into a job's dish, and the kinds of the described food."""
         kinds: set[str] = set()
         for job in service.jobs:
-            kinds |= self.recipes.ancestors(job.target)
+            kinds |= self.recipes.ancestors(job.order.dish)
         for item in described:
             if item in self.kitchen.foods:
                 kinds.add(self.kitchen.foods[item])
@@ -968,7 +870,7 @@ class _Planner:
             vessel = kitchen.vessels.get(item)
             if vessel is not None and vessel.dispenser is not None:
                 mine.add(vessel.dispenser)
-        foods = self.recipes.ancestors(job.target)
+        foods = self.recipes.ancestors(job.order.dish)
         stations_needed = {
             station
             for food in foods
