@@ -400,9 +400,15 @@ def _described(service: Service) -> set[str]:
 def _describe_place(
     kitchen: Kitchen, service: Service, item: str, problem: ProblemBuilder
 ) -> None:
+    """State where an item is: in a chef's hands or on a described tile.
+
+    An item on a tile the problem leaves out gets no place, so it cannot be
+    used, rather than a fact about an undeclared object (Fast Downward
+    rejects the whole problem for that).
+    """
     if item in kitchen.held_by:
         problem.add_fact(f"(holding {kitchen.held_by[item]} {item})")
-    elif item in kitchen.on_slot:
+    elif item in kitchen.on_slot and kitchen.on_slot[item] in service.slots:
         problem.add_fact(f"(at {item} {kitchen.on_slot[item]})")
 
 

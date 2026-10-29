@@ -416,7 +416,7 @@ class _Planner:
         for vessel in self.kitchen.vessels.values():
             if vessel.name == name and not vessel.plate:
                 place = self.kitchen.on_slot.get(vessel.symbol)
-                if place is not None and place in reach:
+                if self._usable(place, reach):
                     tiles.append(place)
         unclaimed = [symbol for symbol in tiles if symbol not in claimed]
         return unclaimed or tiles
@@ -457,15 +457,13 @@ class _Planner:
         job = Job(symbol=f"j_{len(service.jobs)}", order=order, crew=list(crew))
         for symbol in self.kitchen.foods:
             place = self.kitchen.place_of(symbol)
-            if self.kitchen.holder_of(symbol) in crew or (
-                place is not None and place in reach
-            ):
+            if self.kitchen.holder_of(symbol) in crew or self._usable(place, reach):
                 job.items.add(symbol)
         for symbol, vessel in self.kitchen.vessels.items():
             place = self.kitchen.on_slot.get(symbol)
             if (
                 self.kitchen.held_by.get(symbol) in crew
-                or (place is not None and place in reach)
+                or self._usable(place, reach)
                 or (vessel.dispenser is not None and vessel.dispenser in reach)
             ):
                 job.items.add(symbol)
@@ -703,9 +701,7 @@ class _Planner:
             else:
                 place = self.kitchen.on_slot.get(vessel.symbol)
                 distance = (
-                    self._distance(place, crew)
-                    if place is not None and place in reach
-                    else None
+                    self._distance(place, crew) if self._usable(place, reach) else None
                 )
             if distance is None:
                 continue
@@ -785,6 +781,19 @@ class _Planner:
         if not options:
             return None
         return min(options)[2]
+
+    def _usable(self, place: str | None, reach: set[str]) -> bool:
+        """Return whether something standing on ``place`` can be used.
+
+        The tile must be in reach and one the model describes: a tile with
+        two fixed stations (a stove on an oven) is blocked and left out of
+        the problem, so nothing on it can be planned with.
+        """
+        return (
+            place is not None
+            and place in reach
+            and not self.kitchen.slots[place].blocked
+        )
 
     def _distance(self, slot: str, crew: list[str]) -> int:
         return min(
