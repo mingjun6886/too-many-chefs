@@ -34,8 +34,14 @@ from controllers.pddl.submission.kitchen import (
     kind_symbol,
     read_kitchen,
 )
-from controllers.pddl.submission.service import Service, burns, needed, plan_service
-from simulator.entities import Agent, Equipment, OvercookedState
+from controllers.pddl.submission.service import (
+    Service,
+    burns,
+    needed,
+    plan_service,
+    watched_foods,
+)
+from simulator.entities import Agent, Equipment, Food, OvercookedState
 from simulator.entities.plate import PLATE_NAME
 from simulator.environment import Environment
 
@@ -49,6 +55,9 @@ PLANNING_GAP_SECONDS = 0.25
 # Chefs that move for this many timesteps without anything changing hands or
 # scoring are going round in circles (two chefs swapping tiles, say).
 IDLE_STEPS = 40
+# An order change waits up to this many timesteps while a station that cooks
+# by itself holds food that burns there (see ``_watching``).
+WATCH_STEPS = 8
 
 
 class DefaultProblemGenerator(ProblemGenerator):
@@ -66,6 +75,8 @@ class DefaultProblemGenerator(ProblemGenerator):
         # What the chefs hold and the score, and when that last changed.
         self._signature: tuple[object, ...] | None = None
         self._changed_at = 0
+        # Timestep at which an order change was first held back.
+        self._held_since: int | None = None
 
     def to_pddl(
         self,
@@ -86,6 +97,12 @@ class DefaultProblemGenerator(ProblemGenerator):
         revision = state.order_revision if state is not None else 0
         if self._revision is None or revision != self._revision:
             first = self._revision is None
+            if not first and self._watching(environment, state):
+                if self._held_since is None:
+                    self._held_since = environment.timestep
+                if environment.timestep - self._held_since < WATCH_STEPS:
+                    return False
+            self._held_since = None
             self._revision = revision
             self._watch(environment.timestep)
             if first:
@@ -112,6 +129,31 @@ class DefaultProblemGenerator(ProblemGenerator):
         self._started_at = environment.timestep
         self._watch(environment.timestep)
         return True
+
+    def _watching(
+        self, environment: Environment, state: OvercookedState | None
+    ) -> bool:
+        """Return whether a chef may be watching food that burns if left.
+
+        A replan then would hand the scoop to whichever chef the planner
+        likes, often one too far away to save the patty, so the plan that
+        put it in finishes first.
+        """
+        if state is None:
+            return False
+        held: list[tuple[str, str]] = []
+        for equipment in environment.get_entities_of_type(Equipment):
+            if equipment.cooks_by_itself and equipment.held_item_id:
+                food = environment.get_entity_as(equipment.held_item_id, Food)
+                if food is not None:
+                    held.append((equipment.name, food.name))
+        if not held:
+            return False
+        self_cooking = {name for name, _ in held}
+        watched = watched_foods(
+            state, self_cooking, needed(state, state.visible_orders)
+        )
+        return any(pair in watched for pair in held)
 
     def _going_round(
         self, environment: Environment, state: OvercookedState | None
@@ -209,16 +251,14 @@ def describe_kinds(
             problem.add_fact(f"(raw {symbol})")
         if name not in wanted or attempt >= 2:
             problem.add_fact(f"(waste {symbol})")
-    burning = burns(state, kitchen, wanted)
+    for equipment_name, food_name in sorted(burns(state, kitchen.self_cooking, wanted)):
+        equipment = equipment_symbol(equipment_name)
+        if equipment in kitchen.equipment and food_name in names:
+            problem.add_fact(f"(burns {equipment} {kind_symbol(food_name)})")
     for recipe in state.cook_recipes:
         equipment = equipment_symbol(recipe.equipment)
         if equipment not in kitchen.equipment:
             continue
-        if (
-            recipe.equipment,
-            recipe.ingredient,
-        ) in burning and recipe.ingredient in names:
-            problem.add_fact(f"(burns {equipment} {kind_symbol(recipe.ingredient)})")
         if recipe.ingredient not in names or recipe.output not in names:
             continue
         problem.add_fact(
@@ -249,17 +289,28 @@ def describe_equipment(
     """Declare equipment kinds: what each accepts and what base it needs.
 
     A plate takes any food on the way to an order. Other equipment takes
-    what the recipes let it take; illegal recipes are never planned.
+    what the recipes let it take; illegal recipes are never planned. Food
+    that burns in a station, or cooks there into food that does, is not
+    accepted there: only ``cook_watch`` puts it in, with the chef waiting by
+    it. Otherwise a plan could park a patty, raw or grilled, in the pan while
+    the chef slices cheese, and the pan would cook it on and burn it.
     """
     entities = environment.get_entities_of_type(Equipment)
     dishes = needed(state, [job.order.dish for job in service.jobs])
+    watched = watched_foods(
+        state,
+        kitchen.self_cooking,
+        needed(state, [order.dish for order in kitchen.orders]),
+    )
     for symbol, name in kitchen.equipment.items():
         problem.add_object(symbol, "ekind")
         for food_name in sorted(service.kinds):
             if name == PLATE_NAME:
                 if food_name in dishes:
                     problem.add_fact(f"(accepts {symbol} {kind_symbol(food_name)})")
-            elif _accepts(state, food_name, name, set()):
+            elif (name, food_name) not in watched and _accepts(
+                state, food_name, name, set()
+            ):
                 problem.add_fact(f"(accepts {symbol} {kind_symbol(food_name)})")
         for entity in entities:
             if entity.name == name and entity.requires:

@@ -155,18 +155,44 @@ def needed(state: OvercookedState, dishes: Collection[str]) -> set[str]:
 
 
 def burns(
-    state: OvercookedState, kitchen: Kitchen, wanted: Collection[str]
+    state: OvercookedState, self_cooking: Collection[str], wanted: Collection[str]
 ) -> set[tuple[str, str]]:
     """Return the (equipment, food) pairs where food left too long is ruined.
 
     Equipment that cooks by itself keeps cooking what is left in it, so food
-    it would turn into something no visible order wants burns there.
+    it would turn into something no visible order wants burns there. With
+    illegal recipes on, it also cooks food it has no recipe for into
+    garbage, so whatever it has finished making burns there too.
     ``problem_generator`` states these as ``(burns ?e ?k)``.
     """
-    return {
+    pairs = {
         (recipe.equipment, recipe.ingredient)
         for recipe in state.cook_recipes
-        if recipe.equipment in kitchen.self_cooking and recipe.output not in wanted
+        if recipe.equipment in self_cooking and recipe.output not in wanted
+    }
+    if state.allow_illegal_recipes:
+        pairs |= {
+            (recipe.equipment, recipe.output)
+            for recipe in state.cook_recipes
+            if recipe.equipment in self_cooking
+            and not state.can_cook_with(recipe.output, recipe.equipment)
+        }
+    return pairs
+
+
+def watched_foods(
+    state: OvercookedState, self_cooking: Collection[str], wanted: Collection[str]
+) -> set[tuple[str, str]]:
+    """Return the (equipment, food) pairs a chef must watch in that station.
+
+    That is food that burns there and food that cooks there into food that
+    burns, like raw and grilled patties in a pan that burns them.
+    """
+    burning = burns(state, self_cooking, wanted)
+    return burning | {
+        (recipe.equipment, recipe.ingredient)
+        for recipe in state.cook_recipes
+        if (recipe.equipment, recipe.output) in burning
     }
 
 
@@ -224,10 +250,11 @@ class _Planner:
         wanted = recipes.needed([order.dish for order in kitchen.orders])
         # Watched stations: every wanted food made there burns if left, like
         # the pan that burns a patty. The domain only lets a chef cook such
-        # food while watching it (cook_watch); food put in another way would
-        # never cook, so plans do not leave food in a watched station between
-        # steps, and jobs may share it.
-        burning = burns(recipes.state, kitchen, wanted)
+        # food while watching it (cook_watch), and the station accepts it no
+        # other way (``problem_generator.describe_equipment``), so plans do
+        # not leave food in a watched station between steps, and jobs may
+        # share it.
+        burning = burns(recipes.state, kitchen.self_cooking, wanted)
         makes: dict[str, set[str]] = defaultdict(set)
         for recipe in recipes.state.cook_recipes:
             if recipe.output in wanted:
