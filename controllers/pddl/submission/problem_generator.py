@@ -18,6 +18,17 @@ something that will not happen. ``attempt`` counts the replans in a row
 that found the kitchen exactly where the last plan started; the generator
 object is copied to the worker with every request, so ``to_pddl`` sees it
 and plans something smaller and different.
+
+The escape: the watch rules for food that burns (food the pan would burn
+goes in only while a chef watches it) once froze a hidden kitchen after two
+tickets: every later plan went nowhere, and a kitchen where nobody acts
+stops the clock, so it sat until the time limit. In a kitchen where those
+rules restrict something, when the kitchen still
+stands still after ``ESCAPE_ATTEMPTS`` replans, or right after a solve slow
+enough to have hit the planner's limit, ``escape`` turns on and problems
+are written without those rules, as main did before them. If even that
+goes nowhere ``WAIT_STALLS`` times, one plan only lets time pass
+(``resting``). The escape ends at the next order change.
 """
 
 from __future__ import annotations
@@ -28,6 +39,7 @@ from pathlib import Path
 
 from controllers.pddl.interfaces import PDDLProblem, ProblemGenerator
 from controllers.pddl.problem_builder import ProblemBuilder
+from controllers.pddl.solvers import DEFAULT_SOLVER_TIME_LIMIT_SECONDS
 from controllers.pddl.submission.kitchen import (
     Kitchen,
     equipment_symbol,
@@ -58,6 +70,16 @@ IDLE_STEPS = 40
 # An order change waits up to this many timesteps while a station that cooks
 # by itself holds food that burns there (see ``_watching``).
 WATCH_STEPS = 8
+# Replans in a row that find the kitchen where the last plan started before
+# the escape turns on. No run of a fully scored level reached this.
+ESCAPE_ATTEMPTS = 2
+# A solve this long (wall seconds) that leaves the kitchen where it was also
+# turns the escape on: just under the time after which the planner gives up.
+# The longest plan seen locally took 12.9 s (slow cores, under load) and
+# moved the kitchen.
+SLOW_SOLVE = DEFAULT_SOLVER_TIME_LIMIT_SECONDS - 1
+# Stalls in a row after the escape before one plan only lets time pass.
+WAIT_STALLS = 2
 
 
 class DefaultProblemGenerator(ProblemGenerator):
@@ -77,6 +99,13 @@ class DefaultProblemGenerator(ProblemGenerator):
         self._changed_at = 0
         # Timestep at which an order change was first held back.
         self._held_since: int | None = None
+        # The escape from the watch rules (see the module docstring): whether
+        # it is on, whether the next plan only waits, the longest planning
+        # gap since the last replan, and stalls in a row since it turned on.
+        self.escape = False
+        self.resting = False
+        self._solve_seconds = 0.0
+        self._escape_stalls = 0
 
     def to_pddl(
         self,
@@ -86,7 +115,13 @@ class DefaultProblemGenerator(ProblemGenerator):
         """Return the domain and a problem for ``environment``."""
         return PDDLProblem(
             domain=build_domain(),
-            problem=build_problem(environment, controlled_agent_ids, self.attempt),
+            problem=build_problem(
+                environment,
+                controlled_agent_ids,
+                self.attempt,
+                watch=not self.escape,
+                wait=self.resting,
+            ),
         )
 
     def should_replan(self, environment: Environment) -> bool:
@@ -97,7 +132,7 @@ class DefaultProblemGenerator(ProblemGenerator):
         revision = state.order_revision if state is not None else 0
         if self._revision is None or revision != self._revision:
             first = self._revision is None
-            if not first and self._watching(environment, state):
+            if not first and not self.escape and self._watching(environment, state):
                 if self._held_since is None:
                     self._held_since = environment.timestep
                 if environment.timestep - self._held_since < WATCH_STEPS:
@@ -105,29 +140,50 @@ class DefaultProblemGenerator(ProblemGenerator):
             self._held_since = None
             self._revision = revision
             self._watch(environment.timestep)
+            self.escape = False
+            self._escape_stalls = 0
             if first:
                 self._started_at = environment.timestep
                 return False
             self.attempt = 0
             self._started_at = environment.timestep
-            return True
+            return self._replan()
         if environment.timestep != self._timestep or gap > PLANNING_GAP_SECONDS:
+            if gap > PLANNING_GAP_SECONDS:
+                self._solve_seconds = max(self._solve_seconds, gap)
             self._watch(environment.timestep)
             if self._going_round(environment, state):
                 self.attempt += 1
                 self._started_at = environment.timestep
-                return True
+                return self._replan()
             return False
         self._still_checks += 1
         if self._still_checks < STALL_CHECKS:
             return False
         # Standing still: the plan is done or stuck.
+        resting = False
         if environment.timestep == self._started_at:
             self.attempt += 1
+            if self.escape:
+                self._escape_stalls += 1
+                if self._escape_stalls >= WAIT_STALLS:
+                    resting = True
+                    self._escape_stalls = 0
+            elif (
+                self.attempt >= ESCAPE_ATTEMPTS or self._solve_seconds >= SLOW_SOLVE
+            ) and self._has_watch_rules(environment, state):
+                self.escape = True
         else:
             self.attempt = 0
+            self._escape_stalls = 0
         self._started_at = environment.timestep
         self._watch(environment.timestep)
+        return self._replan(resting)
+
+    def _replan(self, resting: bool = False) -> bool:
+        """Ask for a plan; ``resting`` makes it one that only lets time pass."""
+        self.resting = resting
+        self._solve_seconds = 0.0
         return True
 
     def _watching(
@@ -154,6 +210,26 @@ class DefaultProblemGenerator(ProblemGenerator):
             state, self_cooking, needed(state, state.visible_orders)
         )
         return any(pair in watched for pair in held)
+
+    def _has_watch_rules(
+        self, environment: Environment, state: OvercookedState | None
+    ) -> bool:
+        """Return whether the watch rules restrict anything in this kitchen.
+
+        Only then is there something to escape from; elsewhere the escape
+        would only add waits and restart the order rotation of ``attempt``.
+        """
+        if state is None:
+            return False
+        self_cooking = {
+            equipment.name
+            for equipment in environment.get_entities_of_type(Equipment)
+            if equipment.cooks_by_itself
+        }
+        if not self_cooking:
+            return False
+        wanted = needed(state, state.visible_orders)
+        return bool(watched_foods(state, self_cooking, wanted))
 
     def _going_round(
         self, environment: Environment, state: OvercookedState | None
@@ -189,19 +265,29 @@ def build_problem(
     environment: Environment,
     controlled_agent_ids: Collection[str] | None = None,
     attempt: int = 0,
+    watch: bool = True,
+    wait: bool = False,
 ) -> str:
-    """Describe the next part of the service for the domain in overcooked.pddl."""
+    """Describe the next part of the service for the domain in overcooked.pddl.
+
+    ``watch=False`` leaves out the watch rules for food that burns, as main
+    did before them; ``wait=True`` only lets time pass. Both come from the
+    escape in ``DefaultProblemGenerator.should_replan``.
+    """
     kitchen = read_kitchen(environment, controlled_agent_ids)
     state = environment.get_first_entity_of_type(OvercookedState)
     if state is None:
         raise ValueError("The environment has no OvercookedState")
-    service = plan_service(kitchen, state, attempt)
     problem = ProblemBuilder(domain_name="overcooked", problem_name="kitchen")
+    if wait:
+        describe_rest(kitchen, "wait", problem)
+        return problem.to_pddl()
+    service = plan_service(kitchen, state, attempt, watch)
     if service.rest is not None:
         describe_rest(kitchen, service.rest, problem)
         return problem.to_pddl()
-    describe_kinds(environment, kitchen, service, state, problem, attempt)
-    describe_equipment(environment, kitchen, service, state, problem)
+    describe_kinds(environment, kitchen, service, state, problem, attempt, watch)
+    describe_equipment(environment, kitchen, service, state, problem, watch)
     describe_slots(kitchen, service, problem)
     describe_vessels(kitchen, service, problem)
     describe_food(kitchen, service, problem)
@@ -236,12 +322,14 @@ def describe_kinds(
     state: OvercookedState,
     problem: ProblemBuilder,
     attempt: int = 0,
+    watch: bool = True,
 ) -> None:
     """Declare the food kinds the jobs need, which are raw, and the recipes.
 
     Food no visible order needs is waste, which chefs may bin. After two
     plans in a row went nowhere, anything may be binned. Food that a station
-    cooking by itself would turn into waste burns there if left too long.
+    cooking by itself would turn into waste burns there if left too long;
+    without the watch rules, only what a burn recipe ruins counts.
     """
     names = service.kinds
     wanted = needed(state, [order.dish for order in kitchen.orders])
@@ -251,7 +339,8 @@ def describe_kinds(
             problem.add_fact(f"(raw {symbol})")
         if name not in wanted or attempt >= 2:
             problem.add_fact(f"(waste {symbol})")
-    for equipment_name, food_name in sorted(burns(state, kitchen.self_cooking, wanted)):
+    burning = burns(state, kitchen.self_cooking, wanted, illegal=watch)
+    for equipment_name, food_name in sorted(burning):
         equipment = equipment_symbol(equipment_name)
         if equipment in kitchen.equipment and food_name in names:
             problem.add_fact(f"(burns {equipment} {kind_symbol(food_name)})")
@@ -285,6 +374,7 @@ def describe_equipment(
     service: Service,
     state: OvercookedState,
     problem: ProblemBuilder,
+    watch: bool = True,
 ) -> None:
     """Declare equipment kinds: what each accepts and what base it needs.
 
@@ -294,13 +384,18 @@ def describe_equipment(
     accepted there: only ``cook_watch`` puts it in, with the chef waiting by
     it. Otherwise a plan could park a patty, raw or grilled, in the pan while
     the chef slices cheese, and the pan would cook it on and burn it.
+    Without the watch rules (``watch=False``) the station accepts it again.
     """
     entities = environment.get_entities_of_type(Equipment)
     dishes = needed(state, [job.order.dish for job in service.jobs])
-    watched = watched_foods(
-        state,
-        kitchen.self_cooking,
-        needed(state, [order.dish for order in kitchen.orders]),
+    watched = (
+        watched_foods(
+            state,
+            kitchen.self_cooking,
+            needed(state, [order.dish for order in kitchen.orders]),
+        )
+        if watch
+        else set()
     )
     for symbol, name in kitchen.equipment.items():
         problem.add_object(symbol, "ekind")

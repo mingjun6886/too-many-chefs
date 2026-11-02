@@ -27,6 +27,8 @@ plates and cookware, and leaves everything else out of the problem:
 - When the previous plan stalled without moving the kitchen, ``attempt``
   rises and the next problem plans a single order with every chef, cycling
   through the orders, so one impossible order cannot block the others.
+- When the kitchen keeps standing still, ``watch=False`` plans without the
+  watch rules for food that burns (see ``problem_generator``'s escape).
 
 The result is a ``Service``: the jobs, the items each job owns, the items
 every job may touch (junk in the way, food in a chef's hands), and the tiles
@@ -155,14 +157,18 @@ def needed(state: OvercookedState, dishes: Collection[str]) -> set[str]:
 
 
 def burns(
-    state: OvercookedState, self_cooking: Collection[str], wanted: Collection[str]
+    state: OvercookedState,
+    self_cooking: Collection[str],
+    wanted: Collection[str],
+    illegal: bool = True,
 ) -> set[tuple[str, str]]:
     """Return the (equipment, food) pairs where food left too long is ruined.
 
     Equipment that cooks by itself keeps cooking what is left in it, so food
     it would turn into something no visible order wants burns there. With
     illegal recipes on, it also cooks food it has no recipe for into
-    garbage, so whatever it has finished making burns there too.
+    garbage, so whatever it has finished making burns there too;
+    ``illegal=False`` leaves that out, as main did before the watch rules.
     ``problem_generator`` states these as ``(burns ?e ?k)``.
     """
     pairs = {
@@ -170,7 +176,7 @@ def burns(
         for recipe in state.cook_recipes
         if recipe.equipment in self_cooking and recipe.output not in wanted
     }
-    if state.allow_illegal_recipes:
+    if illegal and state.allow_illegal_recipes:
         pairs |= {
             (recipe.equipment, recipe.output)
             for recipe in state.cook_recipes
@@ -196,10 +202,16 @@ def watched_foods(
     }
 
 
-def plan_service(kitchen: Kitchen, state: OvercookedState, attempt: int = 0) -> Service:
-    """Choose the jobs for the next problem and what each one may use."""
+def plan_service(
+    kitchen: Kitchen, state: OvercookedState, attempt: int = 0, watch: bool = True
+) -> Service:
+    """Choose the jobs for the next problem and what each one may use.
+
+    ``watch=False`` drops the burns that only illegal recipes cause, as in
+    the escape from the watch rules.
+    """
     recipes = _Recipes(state)
-    planner = _Planner(kitchen, recipes, attempt)
+    planner = _Planner(kitchen, recipes, attempt, watch)
     candidates = planner.candidates()
     chefs = list(kitchen.chefs)
     service = Service()
@@ -237,7 +249,13 @@ def plan_service(kitchen: Kitchen, state: OvercookedState, attempt: int = 0) -> 
 
 
 class _Planner:
-    def __init__(self, kitchen: Kitchen, recipes: _Recipes, attempt: int = 0) -> None:
+    def __init__(
+        self,
+        kitchen: Kitchen,
+        recipes: _Recipes,
+        attempt: int = 0,
+        watch: bool = True,
+    ) -> None:
         self.kitchen = kitchen
         self.recipes = recipes
         self.taken: set[str] = set()
@@ -254,7 +272,7 @@ class _Planner:
         # other way (``problem_generator.describe_equipment``), so plans do
         # not leave food in a watched station between steps, and jobs may
         # share it.
-        burning = burns(recipes.state, kitchen.self_cooking, wanted)
+        burning = burns(recipes.state, kitchen.self_cooking, wanted, illegal=watch)
         makes: dict[str, set[str]] = defaultdict(set)
         for recipe in recipes.state.cook_recipes:
             if recipe.output in wanted:
