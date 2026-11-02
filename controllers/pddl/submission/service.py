@@ -271,7 +271,8 @@ class _Planner:
         # food while watching it (cook_watch), and the station accepts it no
         # other way (``problem_generator.describe_equipment``), so plans do
         # not leave food in a watched station between steps, and jobs may
-        # share it.
+        # share it. Without the watch rules (``watch=False``) the station
+        # accepts it again, as before those rules.
         burning = burns(recipes.state, kitchen.self_cooking, wanted, illegal=watch)
         makes: dict[str, set[str]] = defaultdict(set)
         for recipe in recipes.state.cook_recipes:

@@ -28,7 +28,8 @@ stands still after ``ESCAPE_ATTEMPTS`` replans, or right after a solve slow
 enough to have hit the planner's limit, ``escape`` turns on and problems
 are written without those rules, as main did before them. If even that
 goes nowhere ``WAIT_STALLS`` times, one plan only lets time pass
-(``resting``). The escape ends at the next order change.
+(``resting``). While it is on, an order change does not wait for the pan
+(``WATCH_STEPS``). The escape ends at the next order change.
 """
 
 from __future__ import annotations
@@ -56,6 +57,7 @@ from controllers.pddl.submission.service import (
 from simulator.entities import Agent, Equipment, Food, OvercookedState
 from simulator.entities.plate import PLATE_NAME
 from simulator.environment import Environment
+from simulator.mutations.advance_cooking import cooking_output
 
 DOMAIN_PATH = Path(__file__).with_name("overcooked.pddl")
 
@@ -189,17 +191,19 @@ class DefaultProblemGenerator(ProblemGenerator):
     def _watching(
         self, environment: Environment, state: OvercookedState | None
     ) -> bool:
-        """Return whether a chef may be watching food that burns if left.
+        """Return whether a station is cooking food that burns if left.
 
         A replan then would hand the scoop to whichever chef the planner
-        likes, often one too far away to save the patty, so the plan that
-        put it in finishes first.
+        likes, often one too far away to save the patty, so the order change
+        waits up to ``WATCH_STEPS`` for the current plan to take it out. Only
+        a station that is cooking counts: the wait is in timesteps, and with
+        nothing cooking and no chef acting the clock would not move.
         """
         if state is None:
             return False
         held: list[tuple[str, str]] = []
         for equipment in environment.get_entities_of_type(Equipment):
-            if equipment.cooks_by_itself and equipment.held_item_id:
+            if equipment.held_item_id and cooking_output(environment, equipment):
                 food = environment.get_entity_as(equipment.held_item_id, Food)
                 if food is not None:
                     held.append((equipment.name, food.name))
@@ -329,7 +333,8 @@ def describe_kinds(
     Food no visible order needs is waste, which chefs may bin. After two
     plans in a row went nowhere, anything may be binned. Food that a station
     cooking by itself would turn into waste burns there if left too long;
-    without the watch rules, only what a burn recipe ruins counts.
+    without the watch rules, only food a recipe there turns into something
+    no visible order wants counts, not garbage from illegal recipes.
     """
     names = service.kinds
     wanted = needed(state, [order.dish for order in kitchen.orders])
